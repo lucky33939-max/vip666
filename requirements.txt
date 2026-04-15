@@ -1,0 +1,8 @@
+fastapi
+uvicorn[standard]
+aiogram
+python-dotenv
+psycopg2-binary
+requests
+aiohttp
+pillow
