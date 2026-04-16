@@ -1050,7 +1050,19 @@ def group_history(
 @app.get("/healthz")
 def healthz():
     return {"ok": True}
+from fastapi import Request
+import httpx
 
+BOT_SERVER = "http://159.223.165.8:8080/webhook"
+
+@app.post("/webhook")
+async def telegram_webhook(request: Request):
+    data = await request.json()
+
+    async with httpx.AsyncClient() as client:
+        await client.post(BOT_SERVER, json=data)
+
+    return {"ok": True}
 
 # ================= RUN =================
 if __name__ == "__main__":
