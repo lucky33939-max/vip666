@@ -916,14 +916,6 @@ def user_revoke_action(
 
 
 def render_orders_page(token: str | None = None, status: str | None = None):
-@app.get("/orders", response_class=HTMLResponse)
-def orders_page(
-    token: str | None = Query(default=None),
-    status: str | None = Query(default=None),
-):
-    require_token(token)
-    return render_orders_page(token=token, status=status)
-
     if status in ("pending", "paid", "rejected"):
         rows = get_rental_orders_by_status(status, limit=100)
         title = f"订单管理 - {status}"
@@ -1004,7 +996,14 @@ def orders_page(
     </div>
     """
     return page_shell(title, body)
-
+    
+@app.get("/orders", response_class=HTMLResponse)
+def orders_page(
+    token: str | None = Query(default=None),
+    status: str | None = Query(default=None),
+):
+    require_token(token)
+    return render_orders_page(token=token, status=status)
 
 @app.get("/order/{order_code}/approve")
 def order_approve_action(order_code: str, token: str | None = Query(default=None)):
