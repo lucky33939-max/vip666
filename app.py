@@ -1,21 +1,21 @@
 import os
 import re
 import time
+import json
 import asyncio
+import traceback
 from io import BytesIO
 from html import escape
 from datetime import datetime, timedelta
 from contextlib import asynccontextmanager
 from zoneinfo import ZoneInfo
 from urllib.parse import urlencode
-import traceback
-import json
 
 import requests
 import aiohttp
 from PIL import Image, ImageDraw, ImageFont
 
-from fastapi import FastAPI, Request, HTTPException, Form
+from fastapi import FastAPI, Request, HTTPException, Form, Query
 from fastapi.responses import HTMLResponse, RedirectResponse
 from aiogram import Bot, Dispatcher, types
 from aiogram.fsm.storage.memory import MemoryStorage
@@ -27,7 +27,6 @@ from aiogram.types import (
     ReplyKeyboardMarkup,
     KeyboardButton,
     BufferedInputFile,
-    CopyTextButton,
 )
 from aiogram.client.default import DefaultBotProperties
 from dotenv import load_dotenv
@@ -37,15 +36,15 @@ from db import (
     init_db,
     get_setting,
     set_setting,
-    get_all_button_configs,
     get_admin,
     add_admin,
     remove_admin,
     get_all_admins,
     save_group,
+    save_member,
     get_groups,
     is_operator,
-    save_member,
+    get_members,
     add_transaction,
     get_last_transaction,
     add_wallet_check,
@@ -56,6 +55,7 @@ from db import (
     set_trial_code,
     get_trial_code,
     add_access_user,
+    remove_access_user,
     has_access_user,
     get_access_users,
     has_claimed_free_trial,
@@ -69,6 +69,16 @@ from db import (
     get_access_user_by_id,
     has_expiry_notice,
     add_expiry_notice,
+    get_expired_access_users,
+    count_access_users,
+    count_active_access_users,
+    count_expired_access_users,
+    count_permanent_access_users,
+    get_access_users_page,
+    count_access_users_filtered,
+    extend_access_user,
+    set_access_user_permanent,
+    approve_rental_order,
     get_db,
 )
 
@@ -83,8 +93,7 @@ SUPER_ADMIN_ID = int(os.getenv("SUPER_ADMIN_ID", "0") or 0)
 
 WEB_TOKEN = os.getenv("WEB_TOKEN", "").strip()
 TELEGRAM_SECRET_TOKEN = os.getenv("TELEGRAM_SECRET_TOKEN", "").strip()
-WELCOME_TEXT = os.getenv("WELCOME_TEXT", "欢迎 {name} 加入本群。").strip()
-WEB_ADMIN_NAME = os.getenv("WEB_ADMIN_NAME", "BOT 888").strip() or "BOT 888"
+
 WEB_ADMIN_NAME = os.getenv("WEB_ADMIN_NAME", "BOT 888").strip() or "BOT 888"
 
 BOT_BASE_URL = (
@@ -104,17 +113,34 @@ TRONGRID_API_URL = "https://api.trongrid.io"
 
 PAYMENT_ADDRESS = os.getenv("PAYMENT_ADDRESS", "TSPpLmYuFXLi6GU1W4uyG6NKGbdWPw886U").strip()
 PAYMENT_SUPPORT = os.getenv("PAYMENT_SUPPORT", "/ZZB339").strip()
+
 AUTO_PAY_INTERVAL = int(os.getenv("AUTO_PAY_INTERVAL", "15"))
 AUTO_PAY_TX_LIMIT = int(os.getenv("AUTO_PAY_TX_LIMIT", "20"))
 AUTO_PAY_TOLERANCE = float(os.getenv("AUTO_PAY_TOLERANCE", "0.0001"))
+
 WELCOME_ENABLED = os.getenv("WELCOME_ENABLED", "1").strip() == "1"
 WELCOME_TEXT = os.getenv("WELCOME_TEXT", "欢迎 {name} 加入本群。").strip()
+
+ENV_MODE = os.getenv("ENV", "dev").lower()
+IS_PRODUCTION = ENV_MODE == "prod"
 
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN is missing in environment variables")
 
 if not WEB_TOKEN:
     raise RuntimeError("WEB_TOKEN is missing in environment variables")
+
+# ================= GLOBALS =================
+BEIJING_TZ = ZoneInfo("Asia/Shanghai")
+USDT_TRC20_CONTRACT = "TXLAQ63Xg1NAzckPwKHvzw7CSEmLMEqcdj"
+TRON_ADDR_RE = re.compile(r"\bT[1-9A-HJ-NP-Za-km-z]{33}\b")
+
+BOT_USERNAME = None
+HTTP_SESSION = None
+
+RATE_CACHE = {"value": None, "ts": 0}
+RATE_CACHE_TTL = 30
+USDT_DAILY_UPDATE_KEY = "usdt_daily_update_date"
 
 # ================= BOT =================
 bot = Bot(
@@ -126,7 +152,115 @@ BOT_USERNAME = None
 
 HTTP_SESSION = None  # dùng chung cho aiohttp
 
-# ================= APP =================
+# ================= BACKGROUND TASKS =================
+async def daily_usdt_update_loop():
+    while True:
+        try:
+            # placeholder, để sau nâng cấp thêm nếu cần
+            await asyncio.sleep(3600)
+        except Exception as e:
+            print("daily_usdt_update_loop error:", e)
+            await asyncio.sleep(60)
+
+async def expiry_warning_loop():
+    while True:
+        try:
+            now_ts = int(time.time())
+            rows = get_expired_access_users(now_ts)
+
+            for user_id, username, expires_at in rows:
+                notice_key = f"expired:{expires_at}"
+                if has_expiry_notice(user_id, notice_key):
+                    continue
+
+                try:
+                    await bot.send_message(
+                        user_id,
+                        "⛔ 您的使用权限已到期。\n如需继续使用，请联系管理员或自助续费。"
+                    )
+                except Exception as e:
+                    print("expiry notify error:", e)
+
+                add_expiry_notice(user_id, notice_key)
+
+        except Exception as e:
+            print("expiry_warning_loop error:", e)
+
+        await asyncio.sleep(300)
+
+async def activate_rental_order(order_code, granted_by=None):
+    try:
+        return approve_rental_order(order_code, granted_by=granted_by)
+    except Exception as e:
+        print("activate_rental_order error:", e)
+        return None, None, str(e)
+
+async def get_usdt_in_transactions(address, limit=AUTO_PAY_TX_LIMIT):
+    data = await trongrid_get(
+        f"/v1/accounts/{address}/transactions/trc20",
+        params={"limit": limit, "only_confirmed": "true"},
+    )
+    return data.get("data", []) if data else []
+
+def parse_usdt_tx(tx):
+    try:
+        return {
+            "to": tx.get("to"),
+            "amount": float(tx.get("value", 0)) / 1_000_000,
+            "txid": tx.get("transaction_id"),
+        }
+    except Exception:
+        return None
+
+async def auto_check_payments():
+    while True:
+        try:
+            orders = get_pending_rental_orders(limit=100)
+            txs = await get_usdt_in_transactions(PAYMENT_ADDRESS)
+            parsed = [p for p in (parse_usdt_tx(tx) for tx in txs) if p]
+
+            used_txids = set()
+
+            for order_code, user_id, username, full_name, category_title, plan_label, amount, created_at in orders:
+                amount = float(amount)
+
+                for tx in parsed:
+                    txid = tx.get("txid")
+                    if not txid or txid in used_txids:
+                        continue
+
+                    if (
+                        tx.get("to") == PAYMENT_ADDRESS
+                        and abs(float(tx.get("amount", 0)) - amount) < AUTO_PAY_TOLERANCE
+                    ):
+                        _, new_expires_at, err = await activate_rental_order(order_code)
+
+                        if not err:
+                            used_txids.add(txid)
+                            try:
+                                await bot.send_message(
+                                    user_id,
+                                    (
+                                        "✅ 自动到账\n"
+                                        f"订单：<code>{order_code}</code>\n"
+                                        f"金额：{amount}U\n"
+                                        f"到期：{fmt_ts(new_expires_at)}"
+                                    ),
+                                    parse_mode="HTML",
+                                )
+                            except Exception as e:
+                                print("notify auto paid error:", e)
+
+                            print("AUTO PAID:", order_code, txid)
+                            break
+
+        except Exception as e:
+            print("AUTO PAY ERROR:", e)
+            traceback.print_exc()
+
+        await asyncio.sleep(AUTO_PAY_INTERVAL)
+
+# ================= APP LIFESPAN =================
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global BOT_USERNAME, HTTP_SESSION
@@ -140,6 +274,7 @@ async def lifespan(app: FastAPI):
     try:
         me = await bot.get_me()
         BOT_USERNAME = me.username
+        print("Bot username:", BOT_USERNAME)
     except Exception as e:
         print("get_me error:", e)
 
@@ -174,8 +309,8 @@ async def lifespan(app: FastAPI):
                 await task
             except asyncio.CancelledError:
                 pass
-            except Exception:
-                pass
+            except Exception as e:
+                print("task shutdown error:", e)
 
         if BOT_BASE_URL:
             try:
@@ -186,81 +321,15 @@ async def lifespan(app: FastAPI):
         try:
             if HTTP_SESSION:
                 await HTTP_SESSION.close()
-        except Exception:
-            pass
+        except Exception as e:
+            print("HTTP_SESSION close error:", e)
 
         try:
             await bot.session.close()
-        except Exception:
-            pass
-            
-async def get_usdt_in_transactions(address, limit=AUTO_PAY_TX_LIMIT):
-    data = await trongrid_get(
-        f"/v1/accounts/{address}/transactions/trc20",
-        params={"limit": limit, "only_confirmed": "true"},
-    )
-    return data.get("data", []) if data else []
-
-
-def parse_usdt_tx(tx):
-    try:
-        return {
-            "to": tx.get("to"),
-            "amount": float(tx.get("value", 0)) / 1_000_000,
-            "txid": tx.get("transaction_id"),
-        }
-    except Exception:
-        return None
-async def auto_check_payments():
-    while True:
-        try:
-            orders = get_pending_rental_orders()
-            txs = await get_usdt_in_transactions(PAYMENT_ADDRESS)
-            parsed = [p for p in (parse_usdt_tx(tx) for tx in txs) if p]
-
-            used_txids = set()
-
-            for order_code, user_id, username, full_name, category_title, plan_label, amount, created_at in orders:
-                amount = float(amount)
-
-                for tx in parsed:
-                    txid = tx.get("txid")
-                    if not txid or txid in used_txids:
-                        continue
-
-                    if (
-                        tx.get("to") == PAYMENT_ADDRESS
-                        and abs(float(tx.get("amount", 0)) - amount) < AUTO_PAY_TOLERANCE
-                    ):
-                        _, _, err = await activate_rental_order(order_code)
-
-                        if not err:
-                            used_txids.add(txid)
-                            await bot.send_message(
-                                user_id,
-                                f"✅ 自动到账\n💰 {fmt_num(amount)}U\n🎉 VIP已开通"
-                            )
-                            print("AUTO PAID:", order_code, txid)
-                            break
-
         except Exception as e:
-            print("AUTO PAY ERROR:", e)
-            traceback.print_exc()
-
-        await asyncio.sleep(AUTO_PAY_INTERVAL)
-
+            print("bot session close error:", e)
 
 app = FastAPI(lifespan=lifespan)
-
-# ================= CONSTANTS =================
-BEIJING_TZ = ZoneInfo("Asia/Shanghai")
-USDT_TRC20_CONTRACT = "TXLAQ63Xg1NAzckPwKHvzw7CSEmLMEqcdj"
-
-RATE_CACHE = {"value": None, "ts": 0}
-RATE_CACHE_TTL = 30
-USDT_DAILY_UPDATE_KEY = "usdt_daily_update_date"
-
-TRON_ADDR_RE = re.compile(r"\bT[1-9A-HJ-NP-Za-km-z]{33}\b")
 
 # ================= STATES =================
 class BroadcastFSM(StatesGroup):
@@ -350,7 +419,7 @@ def get_fee(chat_id):
         return 7.0
 
 def get_enabled(chat_id):
-    return str(get_chat_setting(chat_id, "enabled", "0")) == "1"
+    return str(get_chat_setting(chat_id, "enabled", "1")) == "1"
 
 def is_bot_owner(user_id):
     return bool(BOT_OWNER_ID and int(user_id) == int(BOT_OWNER_ID))
@@ -441,11 +510,7 @@ async def send_long_text(chat_id, text, reply_markup=None, parse_mode="HTML"):
         )
 
 def day_range(ts=None):
-    if ts is None:
-        dt = datetime.now(BEIJING_TZ)
-    else:
-        dt = datetime.fromtimestamp(int(ts), BEIJING_TZ)
-
+    dt = datetime.now(BEIJING_TZ) if ts is None else datetime.fromtimestamp(int(ts), BEIJING_TZ)
     start = dt.replace(hour=0, minute=0, second=0, microsecond=0)
     end = start + timedelta(days=1) - timedelta(seconds=1)
     return int(start.timestamp()), int(end.timestamp())
@@ -464,6 +529,7 @@ def month_range(offset_months=0):
         nxt = datetime(year + 1, 1, 1, tzinfo=BEIJING_TZ)
     else:
         nxt = datetime(year, month + 1, 1, tzinfo=BEIJING_TZ)
+
     end = nxt - timedelta(seconds=1)
     return int(start.timestamp()), int(end.timestamp())
 
@@ -563,6 +629,7 @@ def parse_amount_expr(expr, chat_id, default_direct_unit=False):
     rate_default = get_rate(chat_id)
     fee_default = get_fee(chat_id)
 
+    # Ví dụ: 777u
     if body.lower().endswith("u"):
         num = body[:-1]
         try:
@@ -576,6 +643,7 @@ def parse_amount_expr(expr, chat_id, default_direct_unit=False):
         except Exception:
             return None
 
+    # Ví dụ: 1000/7.8
     if "/" in body:
         try:
             raw_s, rate_s = body.split("/", 1)
@@ -583,8 +651,10 @@ def parse_amount_expr(expr, chat_id, default_direct_unit=False):
             rate_used = float(rate_s)
             if rate_used == 0:
                 return None
+
             fee_used = fee_default
             unit_amount = raw_amount / rate_used * (1 - fee_used / 100.0)
+
             return {
                 "raw_amount": raw_amount,
                 "unit_amount": unit_amount,
@@ -594,12 +664,14 @@ def parse_amount_expr(expr, chat_id, default_direct_unit=False):
         except Exception:
             return None
 
+    # Ví dụ: 100*1.2
     if "*" in body:
         try:
             left_s, right_s = body.split("*", 1)
             raw_amount = abs(float(left_s))
             factor = float(right_s)
             unit_amount = raw_amount * factor
+
             return {
                 "raw_amount": raw_amount,
                 "unit_amount": unit_amount,
@@ -609,6 +681,7 @@ def parse_amount_expr(expr, chat_id, default_direct_unit=False):
         except Exception:
             return None
 
+    # Ví dụ: 1000
     try:
         val = abs(float(body))
     except Exception:
@@ -748,7 +821,7 @@ def report_kb(chat_id):
 
     if WEB_BASE_URL:
         today = datetime.now(BEIJING_TZ).strftime("%Y-%m-%d")
-        params = urlencode({"date": today, "token": WEB_TOKEN})
+        params = urlencode({"date": today})
         group_url = f"{WEB_BASE_URL}/group/{chat_id}?{params}"
         rows.append([InlineKeyboardButton(text="🧾 查看本群账单", url=group_url)])
 
@@ -765,7 +838,7 @@ def history_groups_kb():
 
     for chat_id, title in groups:
         today = datetime.now(BEIJING_TZ).strftime("%Y-%m-%d")
-        params = urlencode({"date": today, "token": WEB_TOKEN})
+        params = urlencode({"date": today})
         url = f"{WEB_BASE_URL}/group/{chat_id}?{params}"
         rows.append([InlineKeyboardButton(text=f"📂 {title}", url=url)])
 
@@ -788,17 +861,37 @@ def address_result_kb(address, page=1):
     return InlineKeyboardMarkup(inline_keyboard=[
         [
             InlineKeyboardButton(text="📜 链上交易记录", callback_data=f"addr:tx:{address}:{page}"),
-            InlineKeyboardButton(text="🔄 重新查询", callback_data="addr:again"),
         ],
-        [InlineKeyboardButton(text="⬅️ 返回菜单", callback_data="addr:back")],
+        [
+            InlineKeyboardButton(text="🔄 重新查询", callback_data="addr:again"),
+            InlineKeyboardButton(text="⬅️ 返回菜单", callback_data="addr:back"),
+        ],
     ])
 
 def tx_history_kb(address, page=1):
     buttons = []
     if page > 1:
-        buttons.append(InlineKeyboardButton(text="⬅️ 上一页", callback_data=f"addr:tx:{address}:{page-1}"))
-    buttons.append(InlineKeyboardButton(text=f"📄 第 {page} 页", callback_data="noop"))
-    buttons.append(InlineKeyboardButton(text="下一页 ➡️", callback_data=f"addr:tx:{address}:{page+1}"))
+        buttons.append(
+            InlineKeyboardButton(
+                text="⬅️ 上一页",
+                callback_data=f"addr:tx:{address}:{page-1}"
+            )
+        )
+
+    buttons.append(
+        InlineKeyboardButton(
+            text=f"📄 第 {page} 页",
+            callback_data="noop"
+        )
+    )
+
+    buttons.append(
+        InlineKeyboardButton(
+            text="下一页 ➡️",
+            callback_data=f"addr:tx:{address}:{page+1}"
+        )
+    )
+
     return InlineKeyboardMarkup(inline_keyboard=[buttons])
 
 # ================= RENT UI =================
@@ -820,7 +913,6 @@ def rent_main_kb():
         [InlineKeyboardButton(text="🤖 Bot quản trị nhóm", callback_data="rent:group_admin")],
         [InlineKeyboardButton(text="💻 Bot máy tính", callback_data="rent:computer")],
         [InlineKeyboardButton(text="🌐 Bot dịch thuật", callback_data="rent:translator")],
-        [InlineKeyboardButton(text="⬅️ Quay lại", callback_data="rent:back")],
     ])
 
 def rent_plan_kb(category_key):
@@ -829,25 +921,26 @@ def rent_plan_kb(category_key):
         [InlineKeyboardButton(text="三个月 (230U)", callback_data=f"rent:plan:{category_key}:3m")],
         [InlineKeyboardButton(text="六个月 (400U)", callback_data=f"rent:plan:{category_key}:6m")],
         [InlineKeyboardButton(text="一年 (700U)", callback_data=f"rent:plan:{category_key}:1y")],
-        [InlineKeyboardButton(text="⬅️ 返回套餐", callback_data="rent:main")],
+        [InlineKeyboardButton(text="⬅️ 返回", callback_data="rent:main")],
     ])
 
 def rent_payment_text(category_key, plan_key, order_code):
     cat = RENT_CATEGORIES.get(category_key, {})
     plan = RENT_PLANS.get(plan_key, {})
-    title = cat.get("title", "套餐")
-    plan_label = plan.get("label", "")
+
+    title = escape(cat.get("title", "套餐"))
+    plan_label = escape(plan.get("label", ""))
     amount = plan.get("amount", 0)
 
     return (
         f"✅ <b>{title}</b>\n"
         f"📦 套餐：<b>{plan_label}</b>\n"
-        f"🧾 订单号：<code>{order_code}</code>\n\n"
+        f"🧾 订单号：<code>{escape(str(order_code))}</code>\n\n"
         f"🌿 <b>收款地址：TRC20-USDT</b>\n"
         f"├ 💰订单金额：<b>{amount} U</b>\n"
-        f"└➤ <code>{PAYMENT_ADDRESS}</code>\n\n"
+        f"└➤ <code>{escape(PAYMENT_ADDRESS)}</code>\n\n"
         f"请按指定金额转账，付款后等待管理员审核开通。\n"
-        f"🗣️ 在线客服：<code>{PAYMENT_SUPPORT}</code>"
+        f"🗣️ 在线客服：<code>{escape(PAYMENT_SUPPORT)}</code>"
     )
 
 def rent_payment_kb(amount):
@@ -943,15 +1036,22 @@ def split_target_prefix(text):
     return None, t
 
 def format_tx_line(tx):
-    tx_id, chat_id, user_id, username, display_name, target_name, kind, raw_amount, unit_amount, rate_used, fee_used, note, original_text, created_at, undone = tx
+    (
+        tx_id, chat_id, user_id, username, display_name, target_name, kind,
+        raw_amount, unit_amount, rate_used, fee_used, note, original_text,
+        created_at, undone
+    ) = tx
+
     tm = datetime.fromtimestamp(created_at, BEIJING_TZ).strftime("%H:%M:%S")
+    safe_target = escape(target_name) if target_name else ""
+    safe_note = escape(note) if note else ""
 
     if kind == "reserve":
         line = f"{tm} {fmt_num(unit_amount)}U"
-        if target_name:
-            line += f" {target_name}"
-        if note:
-            line += f" {note}"
+        if safe_target:
+            line += f" {safe_target}"
+        if safe_note:
+            line += f" {safe_note}"
         return line.strip()
 
     if raw_amount is not None:
@@ -963,12 +1063,14 @@ def format_tx_line(tx):
         line = f"{tm} {fmt_num(unit_amount)}U"
 
     extra = []
-    if target_name:
-        extra.append(target_name)
-    if note:
-        extra.append(note)
+    if safe_target:
+        extra.append(safe_target)
+    if safe_note:
+        extra.append(safe_note)
+
     if extra:
         line += " " + " ".join(extra)
+
     return line.strip()
 
 def summarize_transactions(txs):
@@ -1007,18 +1109,20 @@ def report_text(chat_id, start_ts, end_ts, title="账单", user_id=None, display
     payout_txs = [t for t in txs if t[6] == "payout"]
     reserve_txs = [t for t in txs if t[6] == "reserve"]
 
-    lines = [title]
+    lines = [f"📘 <b>{escape(title)}</b>"]
     if display_name:
-        lines.append(f"用户：{display_name}")
+        lines.append(f"👤 用户：{escape(display_name)}")
 
-    lines.append(f"\n入款（{len(income_txs)}笔）")
+    lines.append("")
+    lines.append(f"🟢 <b>入款（{len(income_txs)}笔）</b>")
     if income_txs:
         for tx in income_txs:
             lines.append(format_tx_line(tx))
     else:
         lines.append("暂无入款")
 
-    lines.append(f"\n下发（{len(payout_txs)}笔）")
+    lines.append("")
+    lines.append(f"🔵 <b>下发（{len(payout_txs)}笔）</b>")
     if payout_txs:
         for tx in payout_txs:
             lines.append(format_tx_line(tx))
@@ -1026,15 +1130,19 @@ def report_text(chat_id, start_ts, end_ts, title="账单", user_id=None, display
         lines.append("暂无下发")
 
     if reserve_txs:
-        lines.append(f"\n寄存（{len(reserve_txs)}笔）")
+        lines.append("")
+        lines.append(f"🟣 <b>寄存（{len(reserve_txs)}笔）</b>")
         for tx in reserve_txs:
             lines.append(format_tx_line(tx))
 
+    # Thêm lại phần 分组统计
     if user_id is None:
-        lines.append("\n分组统计")
+        lines.append("")
+        lines.append("📂 <b>分组统计</b>")
         group_map = {}
+
         for tx in income_txs:
-            key = tx[5] or "未命名"
+            key = escape(tx[5] or "未命名")
             group_map.setdefault(key, 0.0)
             group_map[key] += float(tx[8] or 0)
 
@@ -1045,13 +1153,14 @@ def report_text(chat_id, start_ts, end_ts, title="账单", user_id=None, display
             lines.append("暂无分组数据")
 
     lines.append("")
-    lines.append(f"总入款：{fmt_num(stats['total_raw_income'])} ({fmt_num(stats['total_income_unit'])}U)")
-    lines.append(f"汇率：{fmt_num(get_rate(chat_id))}")
-    lines.append(f"交易费率：{fmt_num(get_fee(chat_id))}%")
+    lines.append("━━━━━━━━━━━━━━━━━━")
+    lines.append(f"💰 总入款：{fmt_num(stats['total_raw_income'])} ({fmt_num(stats['total_income_unit'])}U)")
+    lines.append(f"📈 汇率：{fmt_num(get_rate(chat_id))}")
+    lines.append(f"📉 交易费率：{fmt_num(get_fee(chat_id))}%")
     lines.append("")
-    lines.append(f"应下发：{fmt_num(stats['due'])}U")
-    lines.append(f"已下发：{fmt_num(stats['paid'])}U")
-    lines.append(f"未下发：{fmt_num(stats['pending'])}U")
+    lines.append(f"📦 应下发：{fmt_num(stats['due'])}U")
+    lines.append(f"✅ 已下发：{fmt_num(stats['paid'])}U")
+    lines.append(f"⏳ 未下发：{fmt_num(stats['pending'])}U")
 
     return "\n".join(lines)
 
@@ -1177,6 +1286,7 @@ async def check_tron_address(address: str):
                     return {"source": source_name, "account": acc}
             except Exception as e:
                 print("wallet api error:", url, e)
+
         return None
 
     result = await asyncio.to_thread(_fetch)
@@ -1231,8 +1341,10 @@ async def check_tron_address(address: str):
         "raw": acc,
     }
 
+
 async def get_tron_transactions(address, page=1, page_size=10):
     offset = max(0, (page - 1) * page_size)
+
     tx_data = await trongrid_get(
         f"/v1/accounts/{address}/transactions",
         params={
@@ -1242,7 +1354,9 @@ async def get_tron_transactions(address, page=1, page_size=10):
             "offset": offset,
         },
     )
+
     return tx_data.get("data", []) if tx_data else []
+
 
 def format_tron_tx_row(tx):
     try:
@@ -1253,14 +1367,17 @@ def format_tron_tx_row(tx):
         tx_type = "-"
         if contract:
             tx_type = contract[0].get("type", "-")
-        return f"• {dt} | {tx_type}\n  <code>{txid}</code>"
+
+        return f"• {dt} | {escape(tx_type)}\n  <code>{escape(txid)}</code>"
     except Exception:
         return "• 无法解析交易"
 
-def format_address_info_text(address, info):
+
+def format_address_info_text(address, info, sender_name=None, user_send_count=None):
     if not info:
         return (
-            f"🔎 查询地址：<code>{address}</code>\n\n"
+            f"🔎 <b>地址查询结果</b>\n\n"
+            f"📌 地址：<code>{escape(address)}</code>\n"
             "⚠️ 无法获取链上数据，请稍后重试。"
         )
 
@@ -1269,17 +1386,31 @@ def format_address_info_text(address, info):
     tx_count = info.get("tx_count", 0)
     first_tx = info.get("create_time") or "-"
     last_active = info.get("latest_time") or "-"
-    sig_status = "已签名地址" if (tx_count or 0) > 0 else "未签名地址"
+    sig_status = "已签名地址" if (tx_count or 0) > 0 else "新钱包 / 未签名地址"
 
-    return (
-        f"🔎 查询地址：<code>{address}</code>\n\n"
-        f"💡 交易次数：{tx_count}\n"
-        f"⏰ 首次交易：{fmt_ts(first_tx)}\n"
-        f"🌟 最后活跃：{fmt_ts(last_active)}\n"
-        f"🔰 签名状态：{sig_status}\n\n"
-        f"💰 USDT余额：{fmt_num(usdt_balance)} USDT\n"
-        f"💰 TRX 余额：{fmt_num(trx_balance)} TRX"
-    )
+    lines = [
+        "🔎 <b>TRON 地址查询</b>",
+        "",
+    ]
+
+    if sender_name:
+        lines.append(f"👤 查询人：<code>{escape(sender_name)}</code>")
+
+    if user_send_count is not None:
+        lines.append(f"📌 本群发送次数：<b>{user_send_count}</b> 次")
+
+    lines.extend([
+        f"📌 地址：<code>{escape(address)}</code>",
+        f"💰 TRX：<b>{fmt_num(trx_balance)}</b>",
+        f"💰 USDT：<b>{fmt_num(usdt_balance)}</b>",
+        f"📊 交易次数：<b>{tx_count if tx_count is not None else 0}</b>",
+        f"🔰 状态：<b>{sig_status}</b>",
+        f"📡 数据来源：<b>{escape(str(info.get('source', '-')))}</b>",
+        f"⏰ 首次交易：<b>{fmt_ts(first_tx)}</b>",
+        f"🌟 最后活跃：<b>{fmt_ts(last_active)}</b>",
+    ])
+
+    return "\n".join(lines)
 
 def make_wallet_card_image(
     address,
@@ -1966,11 +2097,701 @@ async def addr_tx_cb(c: types.CallbackQuery):
 
     await c.answer()
 
+# ================= WALLET UI =================
+def address_result_kb(address, page=1):
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="📜 链上交易记录", callback_data=f"addr:tx:{address}:{page}"),
+        ],
+        [
+            InlineKeyboardButton(text="🔄 重新查询", callback_data="addr:again"),
+            InlineKeyboardButton(text="⬅️ 返回菜单", callback_data="addr:back"),
+        ],
+    ])
+
+def tx_history_kb(address, page=1):
+    buttons = []
+    if page > 1:
+        buttons.append(
+            InlineKeyboardButton(
+                text="⬅️ 上一页",
+                callback_data=f"addr:tx:{address}:{page-1}"
+            )
+        )
+
+    buttons.append(
+        InlineKeyboardButton(
+            text=f"📄 第 {page} 页",
+            callback_data="noop"
+        )
+    )
+
+    buttons.append(
+        InlineKeyboardButton(
+            text="下一页 ➡️",
+            callback_data=f"addr:tx:{address}:{page+1}"
+        )
+    )
+
+    return InlineKeyboardMarkup(inline_keyboard=[buttons])
+
+# ================= WALLET HELPERS =================
+def get_user_wallet_send_count(user_id, chat_id=None):
+    try:
+        with get_db() as (_conn, cur):
+            if chat_id is None:
+                cur.execute(
+                    """
+                    SELECT COUNT(*)
+                    FROM wallet_checks
+                    WHERE user_id = %s
+                    """,
+                    (int(user_id),)
+                )
+            else:
+                cur.execute(
+                    """
+                    SELECT COUNT(*)
+                    FROM wallet_checks
+                    WHERE user_id = %s AND chat_id = %s
+                    """,
+                    (int(user_id), int(chat_id))
+                )
+
+            row = cur.fetchone()
+            return int(row[0] or 0) if row else 0
+    except Exception as e:
+        print("get_user_wallet_send_count error:", e)
+        return 0
+
+def wallet_risk_analysis(info):
+    warnings = []
+    score = 0
+
+    tx_count = info.get("tx_count") or 0
+    trx_balance = float(info.get("trx_balance") or 0)
+    usdt_balance = float(info.get("usdt_balance") or 0)
+    latest_time = info.get("latest_time")
+
+    now_ts = int(time.time())
+
+    if tx_count == 0:
+        warnings.append(("🆕 新钱包", "该地址暂无交易记录，可能为新钱包地址，请结合实际用途继续核对。"))
+    elif tx_count < 3:
+        warnings.append(("⚠️ 注意", "该地址交易次数较少，建议进一步核实。"))
+        score += 1
+
+    if trx_balance < 1:
+        warnings.append(("⚠️ 注意", "TRX余额较低，可能影响链上转账或能量消耗。"))
+        score += 1
+
+    if usdt_balance <= 0:
+        warnings.append(("ℹ️ 提示", "当前USDT余额为0，请确认该地址用途是否正常。"))
+
+    if latest_time:
+        try:
+            lt = int(latest_time)
+            if lt > 10_000_000_000:
+                lt = lt // 1000
+
+            idle_days = (now_ts - lt) // 86400
+
+            if idle_days >= 90:
+                warnings.append(("🚨 高风险", f"该地址已超过 {idle_days} 天未活跃，请谨慎核对。"))
+                score += 2
+            elif idle_days >= 30:
+                warnings.append(("⚠️ 注意", f"该地址已 {idle_days} 天未活跃。"))
+                score += 1
+        except Exception:
+            pass
+
+    if score >= 3:
+        level = "🚨 高风险地址"
+    elif score >= 1:
+        level = "⚠️ 需谨慎核对"
+    else:
+        level = "✅ 基本正常"
+
+    return level, warnings
+
+def build_wallet_warning_html(info):
+    level, warnings = wallet_risk_analysis(info)
+
+    if not warnings:
+        return "\n\n✅ <b>地址状态正常，未发现明显异常。</b>"
+
+    lines = [f"\n\n🛡 <b>风险评估</b>", f"• <b>{escape(level)}</b>"]
+    for tag, msg in warnings:
+        lines.append(f"• <b>{escape(tag)}</b>：{escape(msg)}")
+    return "\n".join(lines)
+
+# ================= TRON API =================
+async def trongrid_get(path, params=None):
+    headers = {
+        "accept": "application/json",
+        "user-agent": "Mozilla/5.0",
+    }
+    if TRONGRID_API_KEY:
+        headers["TRON-PRO-API-KEY"] = TRONGRID_API_KEY
+
+    url = path if path.startswith("http") else f"{TRONGRID_API_URL}{path}"
+
+    if HTTP_SESSION is None:
+        return {}
+
+    async with HTTP_SESSION.get(url, params=params, headers=headers) as resp:
+        if resp.status != 200:
+            return {}
+        return await resp.json()
+
+def _pick_account(payload):
+    if not isinstance(payload, dict):
+        return None
+    if isinstance(payload.get("data"), list) and payload["data"]:
+        return payload["data"][0]
+    if payload.get("address"):
+        return payload
+    if isinstance(payload.get("data"), dict):
+        return payload["data"]
+    return None
+
+def _parse_trc20_usdt(account):
+    if not isinstance(account, dict):
+        return None
+
+    candidates = [
+        "trc20token_balances",
+        "trc20",
+        "tokenBalances",
+        "tokens",
+        "assetV2",
+    ]
+
+    for key in candidates:
+        items = account.get(key)
+        if not items:
+            continue
+
+        if isinstance(items, dict):
+            items = [items]
+        if not isinstance(items, list):
+            continue
+
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+
+            sym = str(
+                item.get("tokenAbbr")
+                or item.get("symbol")
+                or item.get("tokenName")
+                or item.get("name")
+                or ""
+            ).upper()
+
+            contract = str(
+                item.get("contract_address")
+                or item.get("tokenAddress")
+                or item.get("tokenId")
+                or item.get("contract")
+                or ""
+            )
+
+            if sym == "USDT" or contract == USDT_TRC20_CONTRACT:
+                raw = (
+                    item.get("balance")
+                    or item.get("value")
+                    or item.get("amount")
+                    or item.get("tokenValue")
+                )
+                if raw is None:
+                    return 0.0
+
+                try:
+                    decimals = int(item.get("precision") or item.get("decimals") or 6)
+                except Exception:
+                    decimals = 6
+
+                try:
+                    return float(raw) / (10 ** decimals)
+                except Exception:
+                    try:
+                        return float(raw)
+                    except Exception:
+                        return 0.0
+    return None
+
+async def check_tron_address(address: str):
+    def _fetch():
+        headers = {
+            "accept": "application/json",
+            "user-agent": "Mozilla/5.0",
+        }
+        if TRONGRID_API_KEY:
+            headers["TRON-PRO-API-KEY"] = TRONGRID_API_KEY
+
+        sources = [
+            f"https://api.trongrid.io/v1/accounts/{address}",
+            f"https://apilist.tronscanapi.com/api/account?address={address}",
+        ]
+
+        for url in sources:
+            try:
+                r = requests.get(url, timeout=8, headers=headers)
+                if not r.ok:
+                    continue
+                payload = r.json()
+                acc = _pick_account(payload)
+                if acc:
+                    source_name = "trongrid" if "trongrid" in url else "tronscan"
+                    return {"source": source_name, "account": acc}
+            except Exception as e:
+                print("wallet api error:", url, e)
+        return None
+
+    result = await asyncio.to_thread(_fetch)
+    if not result:
+        return None
+
+    acc = result["account"]
+
+    trx_balance = None
+    try:
+        if acc.get("balance") is not None:
+            trx_balance = float(acc.get("balance")) / 1_000_000
+    except Exception as e:
+        print("trx_balance parse error:", e)
+
+    usdt_balance = _parse_trc20_usdt(acc)
+
+    tx_count = (
+        acc.get("transaction_count")
+        or acc.get("txCount")
+        or acc.get("transactionsCount")
+        or acc.get("totalTransactionCount")
+        or acc.get("trxCount")
+        or None
+    )
+    try:
+        tx_count = int(tx_count) if tx_count is not None else None
+    except Exception:
+        tx_count = None
+
+    create_time = (
+        acc.get("create_time")
+        or acc.get("createTime")
+        or acc.get("create_time_ms")
+        or acc.get("createTimeMs")
+    )
+    latest_time = (
+        acc.get("latest_opration_time")
+        or acc.get("latestOperationTime")
+        or acc.get("latest_operation_time")
+        or acc.get("latest_tx_time")
+    )
+
+    return {
+        "source": result["source"],
+        "address": address,
+        "trx_balance": trx_balance,
+        "usdt_balance": usdt_balance,
+        "tx_count": tx_count,
+        "create_time": create_time,
+        "latest_time": latest_time,
+        "raw": acc,
+    }
+
+async def get_tron_transactions(address, page=1, page_size=10):
+    offset = max(0, (page - 1) * page_size)
+    tx_data = await trongrid_get(
+        f"/v1/accounts/{address}/transactions",
+        params={
+            "limit": page_size,
+            "only_confirmed": "true",
+            "order_by": "block_timestamp,desc",
+            "offset": offset,
+        },
+    )
+    return tx_data.get("data", []) if tx_data else []
+
+def format_tron_tx_row(tx):
+    try:
+        ts = tx.get("block_timestamp")
+        dt = datetime.fromtimestamp(ts / 1000, BEIJING_TZ).strftime("%Y-%m-%d %H:%M:%S") if ts else "-"
+        txid = tx.get("txID", "-")
+        contract = tx.get("raw_data", {}).get("contract", [])
+        tx_type = "-"
+        if contract:
+            tx_type = contract[0].get("type", "-")
+        return f"• {dt} | {escape(tx_type)}\n  <code>{escape(txid)}</code>"
+    except Exception:
+        return "• 无法解析交易"
+
+def format_address_info_text(address, info, sender_name=None, user_send_count=None):
+    if not info:
+        return (
+            f"🔎 <b>地址查询结果</b>\n\n"
+            f"📌 地址：<code>{escape(address)}</code>\n"
+            "⚠️ 无法获取链上数据，请稍后重试。"
+        )
+
+    trx_balance = info.get("trx_balance", 0)
+    usdt_balance = info.get("usdt_balance", 0)
+    tx_count = info.get("tx_count", 0)
+    first_tx = info.get("create_time") or "-"
+    last_active = info.get("latest_time") or "-"
+    sig_status = "已签名地址" if (tx_count or 0) > 0 else "新钱包 / 未签名地址"
+
+    lines = [
+        "🔎 <b>TRON 地址查询</b>",
+        "",
+    ]
+
+    if sender_name:
+        lines.append(f"👤 查询人：<code>{escape(sender_name)}</code>")
+
+    if user_send_count is not None:
+        lines.append(f"📌 本群发送次数：<b>{user_send_count}</b> 次")
+
+    lines.extend([
+        f"📌 地址：<code>{escape(address)}</code>",
+        f"💰 TRX：<b>{fmt_num(trx_balance)}</b>",
+        f"💰 USDT：<b>{fmt_num(usdt_balance)}</b>",
+        f"📊 交易次数：<b>{tx_count if tx_count is not None else 0}</b>",
+        f"🔰 状态：<b>{sig_status}</b>",
+        f"📡 数据来源：<b>{escape(str(info.get('source', '-')))}</b>",
+        f"⏰ 首次交易：<b>{fmt_ts(first_tx)}</b>",
+        f"🌟 最后活跃：<b>{fmt_ts(last_active)}</b>",
+    ])
+
+    return "\n".join(lines)
+
+def make_wallet_card_image(
+    address,
+    sender_name,
+    user_send_count=0,
+    trx_balance=None,
+    usdt_balance=None,
+    tx_count=None,
+    source="trongrid",
+    create_time=None,
+    latest_time=None,
+):
+    width, height = 1080, 1350
+
+    top_green = (18, 185, 150)
+    top_green2 = (16, 165, 138)
+    body_bg = (20, 30, 44)
+    panel_bg = (26, 40, 58)
+    panel_bg2 = (30, 46, 66)
+
+    white = (245, 248, 250)
+    mute = (165, 180, 190)
+    gold = (245, 198, 76)
+    blue = (120, 185, 255)
+    green = (100, 235, 160)
+    red = (255, 120, 120)
+    yellow = (255, 210, 90)
+
+    img = Image.new("RGB", (width, height), body_bg)
+    draw = ImageDraw.Draw(img)
+
+    # nền chuyển màu
+    for y in range(height):
+        if y < 330:
+            r = int(top_green[0] * (1 - y / 330) + top_green2[0] * (y / 330))
+            g = int(top_green[1] * (1 - y / 330) + top_green2[1] * (y / 330))
+            b = int(top_green[2] * (1 - y / 330) + top_green2[2] * (y / 330))
+            draw.line([(0, y), (width, y)], fill=(r, g, b))
+        else:
+            draw.line([(0, y), (width, y)], fill=body_bg)
+
+    font_candidates = [
+        "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+        "/usr/share/fonts/opentype/noto/NotoSansCJKSC-Regular.otf",
+        "/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        "arial.ttf",
+    ]
+
+    def load_font(size):
+        for fp in font_candidates:
+            try:
+                return ImageFont.truetype(fp, size)
+            except Exception:
+                pass
+        return ImageFont.load_default()
+
+    font_title = load_font(54)
+    font_sub = load_font(28)
+    font_mid = load_font(32)
+
+    def box(x1, y1, x2, y2, radius=26, fill=panel_bg, outline=None, width=2):
+        draw.rounded_rectangle((x1, y1, x2, y2), radius=radius, fill=fill, outline=outline, width=width)
+
+    def text(x, y, s, font, fill=white):
+        draw.text((x, y), str(s), font=font, fill=fill)
+
+    def center_text(y, s, font, fill=white):
+        bbox = draw.textbbox((0, 0), str(s), font=font)
+        w = bbox[2] - bbox[0]
+        x = (width - w) // 2
+        draw.text((x, y), str(s), font=font, fill=fill)
+
+    def right_badge(x2, y1, label, fill_bg=(48, 78, 118), fill_text=white, pad_x=16, pad_y=10, radius=18):
+        bbox = draw.textbbox((0, 0), str(label), font=font_sub)
+        tw = bbox[2] - bbox[0]
+        th = bbox[3] - bbox[1]
+        x1 = x2 - tw - pad_x * 2
+        y2 = y1 + th + pad_y * 2
+        draw.rounded_rectangle((x1, y1, x2, y2), radius=radius, fill=fill_bg)
+        draw.text((x1 + pad_x, y1 + pad_y - 1), str(label), font=font_sub, fill=fill_text)
+
+    def fmt_time_local(ts):
+        if not ts:
+            return "N/A"
+        try:
+            ts = int(ts)
+            if ts > 10_000_000_000:
+                ts = ts // 1000
+            return datetime.fromtimestamp(ts, BEIJING_TZ).strftime("%Y-%m-%d %H:%M:%S")
+        except Exception:
+            return "N/A"
+
+    # phân tích risk
+    risk_level, _warnings = wallet_risk_analysis({
+        "tx_count": tx_count,
+        "trx_balance": trx_balance,
+        "usdt_balance": usdt_balance,
+        "latest_time": latest_time,
+    })
+
+    risk_color = green
+    if "高风险" in risk_level:
+        risk_color = red
+    elif "谨慎" in risk_level:
+        risk_color = yellow
+
+    tx_status = "已签名地址" if (tx_count or 0) > 0 else "新钱包 / 未签名地址"
+    tx_status_color = green if (tx_count or 0) > 0 else yellow
+
+    # header
+    box(40, 35, 1040, 300, radius=36, fill=top_green2, outline=(255, 255, 255, 40), width=2)
+    box(90, 198, 990, 250, radius=18, fill=(60, 130, 108), outline=(220, 255, 240), width=2)
+
+    center_text(70, "USDT防篡改验证核对", font_title, fill=white)
+    center_text(144, "《请双方谨慎核对地址是否与图中一致，如有误请立即停止付款》", font_sub, fill=(232, 247, 242))
+    center_text(209, address, font_mid, fill=white)
+    center_text(258, f"查询人: {sender_name}", font_sub, fill=(225, 245, 240))
+
+    right_badge(
+        1000,
+        52,
+        f"{sender_name} · 第 {user_send_count} 次",
+        fill_bg=(40, 72, 108),
+        fill_text=white,
+    )
+
+    # thân chính
+    box(40, 330, 1040, 1140, radius=34, fill=panel_bg, outline=(42, 70, 90), width=2)
+    text(70, 360, "🔎 查询地址：", font_mid, fill=white)
+    text(250, 360, address, font_mid, fill=blue)
+
+    box(60, 460, 1020, 1030, radius=28, fill=panel_bg2, outline=(55, 90, 110), width=2)
+
+    rows = [
+        ("🛡 风险等级", risk_level, risk_color),
+        ("💡 交易次数", str(tx_count if tx_count is not None else "N/A"), white),
+        ("⏰ 首次交易", fmt_time_local(create_time), white),
+        ("🌟 最后活跃", fmt_time_local(latest_time), white),
+        ("🔰 签名状态", tx_status, tx_status_color),
+        ("💰 USDT 余额", f"{fmt_num(usdt_balance)} USDT", gold),
+        ("💰 TRX 余额", f"{fmt_num(trx_balance)} TRX", gold),
+        ("📡 数据来源", str(source), mute),
+    ]
+
+    y = 500
+    gap = 64
+    for label, value, value_color in rows:
+        text(85, y, f"{label}：", font_mid, fill=white)
+        text(330, y, value, font_mid, fill=value_color)
+        y += gap
+
+    bio = BytesIO()
+    img.save(bio, "PNG")
+    bio.seek(0)
+    return BufferedInputFile(bio.read(), filename="usdt_check_cn.png")
+
+# ================= ADDRESS QUERY =================
+@dp.message(lambda m: is_private(m) and m.text in ("地址查询", "🔍 地址查询", "📍 地址查询"))
+async def menu_address_query(m: types.Message, state: FSMContext):
+    if not m.from_user:
+        return
+
+    if not can_use_bot_ops(m.from_user.id) and not has_bot_access(m.from_user.id):
+        return await m.reply("❌ 无权限")
+
+    await state.set_state(AddressQueryFSM.waiting_address)
+    await m.reply(
+        "🔍 <b>地址查询</b>\n\n请直接发送 TRON 地址进行查询。\n\n示例：\n<code>TSPpLmYuFXLi6GU1W4uyG6NKGbdWPw886U</code>",
+        parse_mode="HTML",
+    )
+
+@dp.message(AddressQueryFSM.waiting_address)
+async def receive_address_query(m: types.Message, state: FSMContext):
+    if not m.from_user:
+        return
+
+    if not can_use_bot_ops(m.from_user.id) and not has_bot_access(m.from_user.id):
+        return await m.reply("❌ 无权限")
+
+    addr = (m.text or "").strip()
+    if not is_tron_address(addr):
+        return await m.reply(
+            "❌ 地址格式不正确，请重新输入 TRON 地址。\n示例：<code>TSPpLmYuFXLi6GU1W4uyG6NKGbdWPw886U</code>",
+            parse_mode="HTML",
+        )
+
+    wait_msg = await m.reply("⏳ 正在查询链上数据，请稍候...")
+
+    try:
+        info = await check_tron_address(addr)
+        sender_name = m.from_user.full_name or (m.from_user.username or str(m.from_user.id))
+
+        try:
+            add_wallet_check(
+                chat_id=m.chat.id,
+                user_id=m.from_user.id,
+                username=m.from_user.username or "",
+                full_name=m.from_user.full_name or "",
+                address=addr,
+                trx_balance=info.get("trx_balance") if info else None,
+                usdt_balance=info.get("usdt_balance") if info else None,
+                tx_count=info.get("tx_count") if info else None,
+            )
+        except Exception as e:
+            print("private add_wallet_check error:", e)
+
+        user_send_count = get_user_wallet_send_count(m.from_user.id, None)
+
+        text_html = format_address_info_text(
+            addr,
+            info,
+            sender_name=sender_name,
+            user_send_count=user_send_count,
+        )
+
+        if info:
+            text_html += build_wallet_warning_html(info)
+
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🔗 Tronscan", url=f"https://tronscan.org/#/address/{addr}")],
+            [InlineKeyboardButton(text="📄 最近链上交易", callback_data=f"addr:tx:{addr}:1")],
+            [InlineKeyboardButton(text="🔄 重新查询", callback_data="addr:again")],
+            [InlineKeyboardButton(text="⬅️ 返回菜单", callback_data="addr:back")],
+        ])
+
+        try:
+            photo = make_wallet_card_image(
+                address=addr,
+                sender_name=sender_name,
+                user_send_count=user_send_count,
+                trx_balance=info.get("trx_balance") if info else None,
+                usdt_balance=info.get("usdt_balance") if info else None,
+                tx_count=info.get("tx_count") if info else None,
+                source=info.get("source") if info else "unknown",
+                create_time=info.get("create_time") if info else None,
+                latest_time=info.get("latest_time") if info else None,
+            )
+            await m.answer_photo(photo=photo, caption=text_html, reply_markup=kb, parse_mode="HTML")
+        except Exception as e:
+            print("private send wallet photo error:", e)
+            await m.reply(text_html, parse_mode="HTML", reply_markup=kb)
+
+    except Exception as e:
+        print("on-chain query error:", e)
+        await m.reply(
+            f"🔎 查询地址：<code>{escape(addr)}</code>\n\n⚠️ 查询失败，请稍后再试。",
+            parse_mode="HTML",
+        )
+
+    await state.clear()
+
+    try:
+        await wait_msg.delete()
+    except Exception:
+        pass
+
+
+@dp.callback_query(lambda c: c.data == "addr:again")
+async def addr_again_cb(c: types.CallbackQuery, state: FSMContext):
+    if not c.message:
+        return
+    await state.set_state(AddressQueryFSM.waiting_address)
+    await c.message.answer("请重新发送 TRON 地址。")
+    await c.answer()
+
+@dp.callback_query(lambda c: c.data == "addr:back")
+async def addr_back_cb(c: types.CallbackQuery, state: FSMContext):
+    await state.clear()
+    if c.message:
+        await c.message.answer("✅ 已返回主菜单")
+    await c.answer()
+
+@dp.callback_query(lambda c: c.data and c.data.startswith("addr:tx:"))
+async def addr_tx_cb(c: types.CallbackQuery):
+    if not c.message or not c.data:
+        return
+
+    parts = c.data.split(":")
+    if len(parts) < 4:
+        return await c.answer("数据错误", show_alert=True)
+
+    address = parts[2].strip()
+    if not is_tron_address(address):
+        return await c.answer("地址错误", show_alert=True)
+
+    try:
+        page = int(parts[3])
+        if page < 1:
+            page = 1
+    except Exception:
+        page = 1
+
+    await c.message.answer("⏳ 正在加载交易记录，请稍候...")
+
+    try:
+        txs = await get_tron_transactions(address, page=page, page_size=10)
+        if not txs:
+            await c.message.answer(
+                f"🔎 查询地址：<code>{escape(address)}</code>\n📄 当前页无交易记录",
+                parse_mode="HTML"
+            )
+            return await c.answer()
+
+        text = f"🔎 查询地址：<code>{escape(address)}</code>\n🗂 当前页码：第 {page} 页\n\n📄 交易记录：\n"
+        for tx in txs:
+            text += format_tron_tx_row(tx) + "\n\n"
+
+        await c.message.answer(
+            text,
+            parse_mode="HTML",
+            reply_markup=tx_history_kb(address, page)
+        )
+    except Exception as e:
+        print("addr tx cb error:", e)
+        await c.message.answer("⚠️ 交易记录加载失败，请稍后再试。")
+
+    await c.answer()
+
+
 # ================= WALLET AUTO CHECK IN GROUP =================
 @dp.message(lambda m: is_group_message(m) and m.text and extract_tron_address(m.text) is not None)
 async def tron_address_check_handler(m: types.Message):
     if should_ignore_message(m):
         return
+
+    ensure_group(m)
 
     address = extract_tron_address(m.text)
     if not address:
@@ -1981,72 +2802,70 @@ async def tron_address_check_handler(m: types.Message):
     try:
         info = await check_tron_address(address)
         if not info:
-            return await status_msg.edit_text("❌ 未能获取钱包数据，请稍后再试。")
-
-        now_ts = int(time.time())
-        warnings = []
-
-        if info["tx_count"] == 0:
-            warnings.append("该地址暂无交易记录。")
-
-        if info["trx_balance"] is not None and info["trx_balance"] < 1:
-            warnings.append("TRX余额较低，可能影响链上操作。")
-
-        if info["latest_time"]:
             try:
-                lt = int(info["latest_time"])
-                if lt > 10_000_000_000:
-                    lt = lt // 1000
-                if now_ts - lt > 30 * 24 * 3600:
-                    warnings.append("该地址已较长时间未活跃。")
+                return await status_msg.edit_text("❌ 未能获取钱包数据，请稍后再试。")
             except Exception:
-                pass
+                return
 
-        add_wallet_check(
-            chat_id=m.chat.id,
-            user_id=m.from_user.id,
-            username=m.from_user.username or "",
-            full_name=m.from_user.full_name or "",
-            address=address,
-            trx_balance=info["trx_balance"],
-            usdt_balance=info["usdt_balance"],
-            tx_count=info["tx_count"],
-        )
+        tx_count = info.get("tx_count")
+        trx_balance = info.get("trx_balance")
+        usdt_balance = info.get("usdt_balance")
+
+        try:
+            add_wallet_check(
+                chat_id=m.chat.id,
+                user_id=m.from_user.id,
+                username=m.from_user.username or "",
+                full_name=m.from_user.full_name or "",
+                address=address,
+                trx_balance=trx_balance,
+                usdt_balance=usdt_balance,
+                tx_count=tx_count,
+            )
+        except Exception as e:
+            print("add_wallet_check error:", e)
 
         sender_name = m.from_user.full_name or (m.from_user.username or "Unknown")
+        user_send_count = get_user_wallet_send_count(m.from_user.id, m.chat.id)
+
+        caption = format_address_info_text(
+            address,
+            info,
+            sender_name=sender_name,
+            user_send_count=user_send_count,
+        )
+        caption += build_wallet_warning_html(info)
 
         kb = InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="🔗 Tronscan", url=f"https://tronscan.org/#/address/{address}")],
             [InlineKeyboardButton(text="📄 最近链上交易", callback_data=f"addr:tx:{address}:1")],
         ])
 
-        caption = (
-            f"🔎 TRON 地址查询\n"
-            f"• 查询人：`{sender_name}`\n"
-            f"• 地址：`{address}`\n"
-            f"• TRX：`{fmt_num(info['trx_balance'])}`\n"
-            f"• USDT：`{fmt_num(info['usdt_balance'])}`\n"
-            f"• 交易次数：`{info['tx_count'] if info['tx_count'] is not None else 'N/A'}`"
-        )
-
-        if warnings:
-            caption += "\n\n⚠️ 风险提示：\n" + "\n".join([f"• {w}" for w in warnings])
-
         try:
             photo = make_wallet_card_image(
                 address=address,
                 sender_name=sender_name,
-                trx_balance=info["trx_balance"],
-                usdt_balance=info["usdt_balance"],
-                tx_count=info["tx_count"],
-                source=info["source"],
+                user_send_count=user_send_count,
+                trx_balance=trx_balance,
+                usdt_balance=usdt_balance,
+                tx_count=tx_count,
+                source=info.get("source"),
                 create_time=info.get("create_time"),
                 latest_time=info.get("latest_time"),
             )
-            await m.answer_photo(photo=photo, caption=caption, reply_markup=kb, parse_mode="Markdown")
+            await m.answer_photo(
+                photo=photo,
+                caption=caption,
+                reply_markup=kb,
+                parse_mode="HTML",
+            )
         except Exception as e:
             print("send wallet photo error:", e)
-            await m.reply(caption, reply_markup=kb, parse_mode="Markdown")
+            await m.reply(
+                caption,
+                reply_markup=kb,
+                parse_mode="HTML",
+            )
 
     except Exception as e:
         print("tron_address_check_handler error:", e)
@@ -2060,9 +2879,50 @@ async def tron_address_check_handler(m: types.Message):
     except Exception:
         pass
 
+
 # ================= WALLET CHECK LOGS =================
+def build_wallet_logs_text(rows, page, total):
+    text_lines = [
+        "📄 <b>钱包查询记录</b>",
+        f"📍 当前页码：第 <b>{page + 1}</b> 页",
+        f"📊 总记录数：<b>{total}</b>",
+        "",
+    ]
+
+    buttons = []
+
+    for row in rows:
+        _id, chat_id, user_id, username, full_name, address, trx_balance, usdt_balance, tx_count, created_at = row
+        sender = full_name or username or str(user_id)
+        tm = fmt_ts(created_at)
+        status_text = "新钱包 / 未签名地址" if tx_count in (None, 0) else "已签名地址"
+
+        text_lines.append(
+            f"🕒 {tm}\n"
+            f"👥 群组：<code>{chat_id}</code>\n"
+            f"👤 用户：<code>{user_id}</code> {escape(sender)}\n"
+            f"🏷 用户名：@{escape(username or '-')}\n"
+            f"📌 地址：<code>{escape(address)}</code>\n"
+            f"💰 TRX：<b>{fmt_num(trx_balance)}</b> | USDT：<b>{fmt_num(usdt_balance)}</b>\n"
+            f"📊 交易次数：<b>{tx_count if tx_count is not None else 'N/A'}</b>\n"
+            f"🔰 状态：<b>{status_text}</b>\n"
+            f"{'—' * 26}"
+        )
+
+        buttons.append([
+            InlineKeyboardButton(
+                text=f"🔗 {address[:10]}...",
+                url=f"https://tronscan.org/#/address/{address}",
+            )
+        ])
+
+    return "\n\n".join(text_lines), buttons
+
+
 @dp.message(lambda m: m.text == "交易记录")
 async def wallet_logs_menu(m: types.Message):
+    if not m.from_user:
+        return
     if not can_use_manage_panel(m.from_user.id):
         return await m.reply("❌ 无权限")
 
@@ -2071,42 +2931,18 @@ async def wallet_logs_menu(m: types.Message):
         return await m.reply("暂无历史记录。")
 
     total = count_wallet_checks()
-    buttons = []
-    text_lines = [
-        "📄 最近交易",
-        "📍 当前页码：第 1 页",
-        "",
-    ]
-
-    for row in rows:
-        _id, chat_id, user_id, username, full_name, address, trx_balance, usdt_balance, tx_count, created_at = row
-        sender = full_name or username or str(user_id)
-        tm = fmt_ts(created_at)
-
-        text_lines.append(
-            f"🕒 {tm}\n"
-            f"👤 {sender}\n"
-            f"📌 {address}\n"
-            f"💰 TRX: {fmt_num(trx_balance)} | USDT: {fmt_num(usdt_balance)}\n"
-            f"📊 交易次数: {tx_count if tx_count is not None else 'N/A'}\n"
-            f"{'—' * 24}"
-        )
-
-        buttons.append([
-            InlineKeyboardButton(
-                text=f"🔗 {address[:8]}...",
-                url=f"https://tronscan.org/#/address/{address}",
-            )
-        ])
+    text, buttons = build_wallet_logs_text(rows, page=0, total=total)
 
     if total > 10:
         buttons.append([InlineKeyboardButton(text="下一页 ➡️", callback_data="wallet:recent:1")])
 
     await m.reply(
-        "\n".join(text_lines),
+        text,
         reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),
+        parse_mode="HTML",
         disable_web_page_preview=True,
     )
+
 
 @dp.callback_query(lambda c: c.data and c.data.startswith("wallet:recent:"))
 async def wallet_logs_cb(c: types.CallbackQuery):
@@ -2126,40 +2962,14 @@ async def wallet_logs_cb(c: types.CallbackQuery):
 
     rows = get_wallet_checks_page(limit=limit, offset=offset)
     if not rows:
-        return await c.message.edit_text("暂无历史记录。")
+        await c.message.edit_text("暂无历史记录。")
+        return await c.answer()
 
     total = count_wallet_checks()
     has_prev = page > 0
     has_next = offset + limit < total
 
-    text_lines = [
-        "📄 最近交易",
-        f"📍 当前页码：第 {page + 1} 页",
-        "",
-    ]
-
-    buttons = []
-
-    for row in rows:
-        _id, chat_id, user_id, username, full_name, address, trx_balance, usdt_balance, tx_count, created_at = row
-        sender = full_name or username or str(user_id)
-        tm = fmt_ts(created_at)
-
-        text_lines.append(
-            f"🕒 {tm}\n"
-            f"👤 {sender}\n"
-            f"📌 {address}\n"
-            f"💰 TRX: {fmt_num(trx_balance)} | USDT: {fmt_num(usdt_balance)}\n"
-            f"📊 交易次数: {tx_count if tx_count is not None else 'N/A'}\n"
-            f"{'—' * 24}"
-        )
-
-        buttons.append([
-            InlineKeyboardButton(
-                text=f"🔗 {address[:8]}...",
-                url=f"https://tronscan.org/#/address/{address}",
-            )
-        ])
+    text, buttons = build_wallet_logs_text(rows, page=page, total=total)
 
     nav = []
     if has_prev:
@@ -2170,8 +2980,9 @@ async def wallet_logs_cb(c: types.CallbackQuery):
         buttons.append(nav)
 
     await c.message.edit_text(
-        "\n".join(text_lines),
+        text,
         reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),
+        parse_mode="HTML",
         disable_web_page_preview=True,
     )
     await c.answer()
@@ -2909,41 +3720,221 @@ async def webhook(req: Request):
 def get_web_admin_name():
     return WEB_ADMIN_NAME or "BOT 888"
 
-
 def is_web_logged_in(request: Request):
     session = request.cookies.get("god_session", "")
     return session == WEB_TOKEN
 
+def guard(request: Request):
+    if not is_web_logged_in(request):
+        return RedirectResponse(url="/login", status_code=302)
+    return None
+
+def simple_page(title: str, subtitle: str, body: str = ""):
+    return f"""
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{escape(title)}</title>
+<style>
+body {{
+    margin: 0;
+    font-family: Inter, Arial, sans-serif;
+    background: linear-gradient(135deg, #060913 0%, #0a1020 45%, #070b17 100%);
+    color: #eaf2ff;
+    padding: 30px;
+}}
+.wrap {{
+    max-width: 1380px;
+    margin: 0 auto;
+}}
+.top {{
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-bottom: 24px;
+    flex-wrap: wrap;
+    gap: 12px;
+}}
+.title {{
+    font-size: 36px;
+    font-weight: 900;
+}}
+.sub {{
+    color: #8da2c0;
+    margin-top: 8px;
+}}
+.back {{
+    color: white;
+    text-decoration: none;
+    padding: 12px 16px;
+    border-radius: 14px;
+    background: rgba(255,255,255,.05);
+    border: 1px solid rgba(255,255,255,.08);
+}}
+.quick-links {{
+    display: flex;
+    gap: 12px;
+    flex-wrap: wrap;
+    margin-bottom: 18px;
+}}
+.quick-links a {{
+    text-decoration: none;
+    color: white;
+    padding: 10px 14px;
+    border-radius: 12px;
+    background: rgba(255,255,255,.05);
+    border: 1px solid rgba(255,255,255,.08);
+}}
+.card {{
+    background: rgba(17,25,40,.72);
+    border: 1px solid rgba(255,255,255,.08);
+    border-radius: 24px;
+    padding: 24px;
+    margin-bottom: 20px;
+}}
+table {{
+    width: 100%;
+    border-collapse: collapse;
+    margin-top: 18px;
+}}
+th, td {{
+    padding: 14px 12px;
+    border-bottom: 1px solid rgba(255,255,255,.08);
+    text-align: left;
+    vertical-align: top;
+}}
+th {{
+    color: #8da2c0;
+    font-size: 13px;
+    text-transform: uppercase;
+}}
+.badge {{
+    display: inline-block;
+    padding: 6px 12px;
+    border-radius: 999px;
+    background: rgba(34,227,142,.12);
+    border: 1px solid rgba(34,227,142,.2);
+    color: #98f3c5;
+    font-size: 12px;
+    font-weight: 700;
+}}
+.badge.red {{
+    background: rgba(255,93,115,.12);
+    border-color: rgba(255,93,115,.20);
+    color: #ff9baa;
+}}
+.badge.yellow {{
+    background: rgba(255,204,51,.12);
+    border-color: rgba(255,204,51,.20);
+    color: #ffe38b;
+}}
+.mono {{
+    font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+    word-break: break-all;
+}}
+.grid {{
+    display: grid;
+    grid-template-columns: repeat(4, 1fr);
+    gap: 14px;
+}}
+.stat {{
+    background: rgba(255,255,255,.03);
+    border: 1px solid rgba(255,255,255,.06);
+    border-radius: 18px;
+    padding: 16px;
+}}
+.stat-label {{
+    color: #8da2c0;
+    font-size: 12px;
+    margin-bottom: 8px;
+}}
+.stat-value {{
+    font-size: 28px;
+    font-weight: 800;
+}}
+pre {{
+    white-space: pre-wrap;
+    word-break: break-word;
+    color: #eaf2ff;
+}}
+@media (max-width: 980px) {{
+    .grid {{
+        grid-template-columns: 1fr 1fr;
+    }}
+}}
+@media (max-width: 640px) {{
+    .grid {{
+        grid-template-columns: 1fr;
+    }}
+}}
+</style>
+</head>
+<body>
+<div class="wrap">
+    <div class="top">
+        <div>
+            <div class="title">{escape(title)}</div>
+            <div class="sub">{escape(subtitle)}</div>
+        </div>
+        <a class="back" href="/dashboard">← Về Dashboard</a>
+    </div>
+
+    <div class="quick-links">
+        <a href="/dashboard">🏠 Dashboard</a>
+        <a href="/groups">👥 Groups</a>
+        <a href="/transactions">💸 Transactions</a>
+        <a href="/users">👑 Users</a>
+        <a href="/orders">📦 Orders</a>
+        <a href="/admins">🛡 Admins</a>
+        <a href="/wallet-checks">🔎 Wallet Logs</a>
+        <a href="/wallet-summary">📊 Wallet Summary</a>
+    </div>
+
+    {body}
+</div>
+</body>
+</html>
+"""
+
 # ================= DASHBOARD DATA =================
 def dashboard_stats():
     try:
-        stats = {}
+        stats = {
+            "vip_users": 0,
+            "groups": 0,
+            "today_tx": 0,
+            "today_amount": 0.0,
+            "pending_orders": 0,
+            "all_orders": 0,
+            "wallet_checks": 0,
+            "wallet_users": 0,
+        }
 
         with get_db() as (_conn, cur):
             try:
                 cur.execute("SELECT COUNT(*) FROM access_users")
-                stats["vip_users"] = cur.fetchone()[0]
+                stats["vip_users"] = int(cur.fetchone()[0] or 0)
             except Exception as e:
                 print("dashboard vip_users error:", e)
-                stats["vip_users"] = 0
 
             try:
                 cur.execute("SELECT COUNT(*) FROM groups")
-                stats["groups"] = cur.fetchone()[0]
+                stats["groups"] = int(cur.fetchone()[0] or 0)
             except Exception as e:
                 print("dashboard groups error:", e)
-                stats["groups"] = 0
 
             try:
                 start_ts, end_ts = day_range()
                 cur.execute(
-                    """
+                    '''
                     SELECT COUNT(*), COALESCE(SUM(unit_amount), 0)
                     FROM transactions
                     WHERE created_at >= %s
                       AND created_at <= %s
                       AND COALESCE(undone, FALSE) = FALSE
-                    """,
+                    ''',
                     (start_ts, end_ts)
                 )
                 row = cur.fetchone() or (0, 0)
@@ -2951,22 +3942,30 @@ def dashboard_stats():
                 stats["today_amount"] = float(row[1] or 0)
             except Exception as e:
                 print("dashboard today error:", e)
-                stats["today_tx"] = 0
-                stats["today_amount"] = 0
 
             try:
                 cur.execute("SELECT COUNT(*) FROM rental_orders WHERE status = 'pending'")
-                stats["pending_orders"] = cur.fetchone()[0]
+                stats["pending_orders"] = int(cur.fetchone()[0] or 0)
             except Exception as e:
                 print("dashboard pending_orders error:", e)
-                stats["pending_orders"] = 0
 
             try:
                 cur.execute("SELECT COUNT(*) FROM rental_orders")
-                stats["all_orders"] = cur.fetchone()[0]
+                stats["all_orders"] = int(cur.fetchone()[0] or 0)
             except Exception as e:
                 print("dashboard all_orders error:", e)
-                stats["all_orders"] = 0
+
+            try:
+                cur.execute("SELECT COUNT(*) FROM wallet_checks")
+                stats["wallet_checks"] = int(cur.fetchone()[0] or 0)
+            except Exception as e:
+                print("dashboard wallet_checks error:", e)
+
+            try:
+                cur.execute("SELECT COUNT(DISTINCT user_id) FROM wallet_checks")
+                stats["wallet_users"] = int(cur.fetchone()[0] or 0)
+            except Exception as e:
+                print("dashboard wallet_users error:", e)
 
         return stats
 
@@ -2979,8 +3978,9 @@ def dashboard_stats():
             "today_amount": 0,
             "pending_orders": 0,
             "all_orders": 0,
+            "wallet_checks": 0,
+            "wallet_users": 0,
         }
-
 
 def dashboard_chart():
     try:
@@ -2994,13 +3994,13 @@ def dashboard_chart():
                 end = start + timedelta(days=1)
 
                 cur.execute(
-                    """
+                    '''
                     SELECT COALESCE(SUM(unit_amount), 0)
                     FROM transactions
                     WHERE created_at >= %s
                       AND created_at < %s
                       AND COALESCE(undone, FALSE) = FALSE
-                    """,
+                    ''',
                     (int(start.timestamp()), int(end.timestamp()))
                 )
 
@@ -3013,7 +4013,6 @@ def dashboard_chart():
     except Exception as e:
         print("dashboard_chart error:", e)
         return [], []
-
 
 # ================= PREMIUM LOGIN =================
 def premium_login_html(error_msg=""):
@@ -3255,16 +4254,14 @@ body {{
 </html>
 """
 
-
+# ================= ROOT / LOGIN =================
 @app.get("/", response_class=HTMLResponse)
 def home():
     return RedirectResponse(url="/login", status_code=302)
 
-
 @app.head("/")
 def home_head():
     return {"ok": True}
-
 
 @app.get("/login", response_class=HTMLResponse)
 async def login_page(request: Request):
@@ -3272,23 +4269,21 @@ async def login_page(request: Request):
         return RedirectResponse(url="/dashboard", status_code=302)
     return premium_login_html()
 
-
 @app.post("/login")
 async def login_submit(password: str = Form(...)):
     if password != WEB_TOKEN:
         return HTMLResponse(premium_login_html("❌ Sai mật khẩu đăng nhập"), status_code=401)
 
-    resp = RedirectResponse(url="/dashboard", status_code=302)
+    resp = RedirectResponse(url="/dashboard", status_code=303)
     resp.set_cookie(
         key="god_session",
         value=WEB_TOKEN,
         httponly=True,
         samesite="lax",
-        secure=True,
+        secure=IS_PRODUCTION,
         max_age=7 * 24 * 3600,
     )
     return resp
-
 
 @app.get("/logout")
 async def logout():
@@ -3296,17 +4291,18 @@ async def logout():
     resp.delete_cookie("god_session")
     return resp
 
-# ================= GOD DASHBOARD =================
+# ================= DASHBOARD =================
 @app.get("/dashboard", response_class=HTMLResponse)
 async def dashboard(request: Request):
-    if not is_web_logged_in(request):
-        return RedirectResponse(url="/login", status_code=302)
+    auth = guard(request)
+    if auth:
+        return auth
 
     stats = dashboard_stats()
     labels, values = dashboard_chart()
 
-    safe_bot_username = BOT_USERNAME or "-"
-    safe_webhook = f"{BOT_BASE_URL}/webhook" if BOT_BASE_URL else "Not configured"
+    safe_bot_username = escape(BOT_USERNAME or "-")
+    safe_webhook = escape(f"{BOT_BASE_URL}/webhook" if BOT_BASE_URL else "Not configured")
     now_text = datetime.now(BEIJING_TZ).strftime("%Y-%m-%d %H:%M:%S")
     admin_name = escape(get_web_admin_name())
 
@@ -3326,13 +4322,10 @@ async def dashboard(request: Request):
     --green: #22e38e;
     --yellow: #ffcc33;
     --red: #ff5d73;
+    --purple: #b38cff;
     --shadow: 0 20px 50px rgba(0,0,0,.35);
 }}
-* {{
-    margin: 0;
-    padding: 0;
-    box-sizing: border-box;
-}}
+* {{ margin: 0; padding: 0; box-sizing: border-box; }}
 body {{
     font-family: Inter, Arial, sans-serif;
     color: var(--text);
@@ -3343,10 +4336,7 @@ body {{
         linear-gradient(135deg, #060913 0%, #0a1020 45%, #070b17 100%);
     padding: 28px;
 }}
-.container {{
-    max-width: 1480px;
-    margin: 0 auto;
-}}
+.container {{ max-width: 1480px; margin: 0 auto; }}
 .hero {{
     display: flex;
     justify-content: space-between;
@@ -3429,6 +4419,27 @@ body {{
     font-size: 14px;
     color: #8ef0b9;
 }}
+.quick-nav {{
+    display: flex;
+    gap: 12px;
+    flex-wrap: wrap;
+    margin: 18px 0 26px;
+}}
+.quick-btn {{
+    text-decoration: none;
+    color: white;
+    padding: 12px 18px;
+    border-radius: 14px;
+    background: rgba(255,255,255,.05);
+    border: 1px solid rgba(255,255,255,.08);
+    transition: .2s ease;
+    font-weight: 700;
+}}
+.quick-btn:hover {{
+    transform: translateY(-2px);
+    background: rgba(58,184,255,.12);
+    border-color: rgba(58,184,255,.3);
+}}
 .grid {{
     display: grid;
     grid-template-columns: repeat(12, 1fr);
@@ -3440,10 +4451,21 @@ body {{
     border-radius: 24px;
     box-shadow: var(--shadow);
 }}
+.card-link {{
+    text-decoration: none;
+    color: inherit;
+    display: block;
+}}
 .stat {{
     grid-column: span 3;
     padding: 22px;
     min-height: 150px;
+    cursor: pointer;
+    transition: .2s ease;
+}}
+.stat:hover {{
+    transform: translateY(-4px);
+    border-color: rgba(58,184,255,.28);
 }}
 .stat-top {{
     display: flex;
@@ -3477,25 +4499,6 @@ body {{
     color: var(--muted);
     font-size: 13px;
 }}
-.blue {{ color: var(--blue); }}
-.green {{ color: var(--green); }}
-.yellow {{ color: var(--yellow); }}
-.red {{ color: var(--red); }}
-.purple {{ color: #b38cff; }}
-.progress {{
-    width: 100%;
-    height: 8px;
-    border-radius: 999px;
-    background: rgba(255,255,255,.05);
-    overflow: hidden;
-    margin-top: 14px;
-}}
-.progress > span {{
-    display: block;
-    height: 100%;
-    border-radius: 999px;
-    background: linear-gradient(90deg, rgba(58,184,255,.9), rgba(69,243,255,.95));
-}}
 .chart-card {{
     grid-column: span 8;
     padding: 24px;
@@ -3523,9 +4526,7 @@ body {{
     padding: 16px 0;
     border-bottom: 1px solid rgba(255,255,255,.06);
 }}
-.kv:last-child {{
-    border-bottom: none;
-}}
+.kv:last-child {{ border-bottom: none; }}
 .kv-key {{
     color: var(--muted);
     font-size: 13px;
@@ -3539,27 +4540,6 @@ body {{
     word-break: break-all;
     max-width: 70%;
 }}
-.mini-grid {{
-    display: grid;
-    grid-template-columns: 1fr 1fr;
-    gap: 14px;
-    margin-top: 18px;
-}}
-.mini {{
-    background: rgba(255,255,255,.03);
-    border: 1px solid rgba(255,255,255,.06);
-    border-radius: 18px;
-    padding: 16px;
-}}
-.mini-label {{
-    color: var(--muted);
-    font-size: 12px;
-    margin-bottom: 8px;
-}}
-.mini-value {{
-    font-size: 22px;
-    font-weight: 800;
-}}
 .footer {{
     margin-top: 22px;
     text-align: center;
@@ -3567,20 +4547,12 @@ body {{
     font-size: 13px;
 }}
 @media (max-width: 1180px) {{
-    .stat {{
-        grid-column: span 6;
-    }}
-    .chart-card {{
-        grid-column: span 12;
-    }}
-    .side-card {{
-        grid-column: span 12;
-    }}
+    .stat {{ grid-column: span 6; }}
+    .chart-card {{ grid-column: span 12; }}
+    .side-card {{ grid-column: span 12; }}
 }}
 @media (max-width: 720px) {{
-    .stat {{
-        grid-column: span 12;
-    }}
+    .stat {{ grid-column: span 12; }}
 }}
 </style>
 </head>
@@ -3590,7 +4562,7 @@ body {{
         <div>
             <div class="badge">⚡ PREMIUM CONTROL PANEL</div>
             <div class="title">GOD BOT DASHBOARD</div>
-            <div class="subtitle">Real-time Telegram bot analytics • dark premium interface • auto refresh 20s</div>
+            <div class="subtitle">Real-time Telegram bot analytics • dark premium interface • admin control panel</div>
         </div>
 
         <div class="hero-right">
@@ -3606,66 +4578,82 @@ body {{
         </div>
     </div>
 
+    <div class="quick-nav">
+        <a class="quick-btn" href="/dashboard">🏠 Dashboard</a>
+        <a class="quick-btn" href="/groups">👥 Groups</a>
+        <a class="quick-btn" href="/transactions">💸 Transactions</a>
+        <a class="quick-btn" href="/bots">🤖 Bots</a>
+        <a class="quick-btn" href="/admins">🛡 Admins</a>
+        <a class="quick-btn" href="/orders">📦 Orders</a>
+        <a class="quick-btn" href="/users">👑 Users</a>
+        <a class="quick-btn" href="/wallet-checks">🔎 Wallet Logs</a>
+        <a class="quick-btn" href="/wallet-summary">📊 Wallet Summary</a>
+    </div>
+
     <div class="grid">
-        <div class="card stat">
-            <div class="stat-top">
-                <div><div class="stat-label">VIP USERS</div></div>
-                <div class="icon">👑</div>
+        <a class="card card-link" href="/users">
+            <div class="stat">
+                <div class="stat-top"><div><div class="stat-label">VIP USERS</div></div><div class="icon">👑</div></div>
+                <div class="stat-value" style="color:#22e38e;">{stats["vip_users"]}</div>
+                <div class="stat-sub">Premium access accounts</div>
             </div>
-            <div class="stat-value green counter" data-target="{stats["vip_users"]}">0</div>
-            <div class="stat-sub">Premium access accounts</div>
-            <div class="progress"><span style="width:{min(100, max(8, stats["vip_users"] * 8))}%"></span></div>
-        </div>
+        </a>
 
-        <div class="card stat">
-            <div class="stat-top">
-                <div><div class="stat-label">GROUPS</div></div>
-                <div class="icon">👥</div>
+        <a class="card card-link" href="/groups">
+            <div class="stat">
+                <div class="stat-top"><div><div class="stat-label">GROUPS</div></div><div class="icon">👥</div></div>
+                <div class="stat-value" style="color:#3ab8ff;">{stats["groups"]}</div>
+                <div class="stat-sub">Connected Telegram groups</div>
             </div>
-            <div class="stat-value blue counter" data-target="{stats["groups"]}">0</div>
-            <div class="stat-sub">Connected Telegram groups</div>
-            <div class="progress"><span style="width:{min(100, max(8, stats["groups"] * 10))}%"></span></div>
-        </div>
+        </a>
 
-        <div class="card stat">
-            <div class="stat-top">
-                <div><div class="stat-label">TODAY TX</div></div>
-                <div class="icon">📊</div>
+        <a class="card card-link" href="/transactions">
+            <div class="stat">
+                <div class="stat-top"><div><div class="stat-label">TODAY TX</div></div><div class="icon">📊</div></div>
+                <div class="stat-value" style="color:#ffcc33;">{stats["today_tx"]}</div>
+                <div class="stat-sub">Transactions recorded today</div>
             </div>
-            <div class="stat-value yellow counter" data-target="{stats["today_tx"]}">0</div>
-            <div class="stat-sub">Transactions recorded today</div>
-            <div class="progress"><span style="width:{min(100, max(8, stats["today_tx"] * 6))}%"></span></div>
-        </div>
+        </a>
 
-        <div class="card stat">
-            <div class="stat-top">
-                <div><div class="stat-label">TODAY U</div></div>
-                <div class="icon">💸</div>
+        <a class="card card-link" href="/transactions">
+            <div class="stat">
+                <div class="stat-top"><div><div class="stat-label">TODAY U</div></div><div class="icon">💸</div></div>
+                <div class="stat-value" style="color:#22e38e;">{float(stats["today_amount"]):.2f}</div>
+                <div class="stat-sub">Total volume today</div>
             </div>
-            <div class="stat-value green counter-float" data-target="{float(stats["today_amount"]):.2f}">0.00</div>
-            <div class="stat-sub">Total volume today</div>
-            <div class="progress"><span style="width:{min(100, max(8, int(float(stats["today_amount"]) if stats["today_amount"] else 0)))}%"></span></div>
-        </div>
+        </a>
 
-        <div class="card stat">
-            <div class="stat-top">
-                <div><div class="stat-label">PENDING ORDERS</div></div>
-                <div class="icon">⏳</div>
+        <a class="card card-link" href="/orders">
+            <div class="stat">
+                <div class="stat-top"><div><div class="stat-label">PENDING ORDERS</div></div><div class="icon">⏳</div></div>
+                <div class="stat-value" style="color:#ff5d73;">{stats["pending_orders"]}</div>
+                <div class="stat-sub">Orders waiting for approval</div>
             </div>
-            <div class="stat-value red counter" data-target="{stats["pending_orders"]}">0</div>
-            <div class="stat-sub">Orders waiting for approval</div>
-            <div class="progress"><span style="width:{min(100, max(8, stats["pending_orders"] * 15))}%; background:linear-gradient(90deg, rgba(255,93,115,.9), rgba(255,140,102,.95));"></span></div>
-        </div>
+        </a>
 
-        <div class="card stat">
-            <div class="stat-top">
-                <div><div class="stat-label">ALL ORDERS</div></div>
-                <div class="icon">📦</div>
+        <a class="card card-link" href="/orders">
+            <div class="stat">
+                <div class="stat-top"><div><div class="stat-label">ALL ORDERS</div></div><div class="icon">📦</div></div>
+                <div class="stat-value" style="color:#b38cff;">{stats["all_orders"]}</div>
+                <div class="stat-sub">Rental / renew history</div>
             </div>
-            <div class="stat-value purple counter" data-target="{stats["all_orders"]}">0</div>
-            <div class="stat-sub">Total rental / renew history</div>
-            <div class="progress"><span style="width:{min(100, max(8, stats["all_orders"] * 8))}%; background:linear-gradient(90deg, rgba(139,92,246,.9), rgba(59,130,246,.95));"></span></div>
-        </div>
+        </a>
+
+        <a class="card card-link" href="/wallet-checks">
+            <div class="stat">
+                <div class="stat-top"><div><div class="stat-label">WALLET CHECKS</div></div><div class="icon">🔎</div></div>
+                <div class="stat-value" style="color:#3ab8ff;">{stats["wallet_checks"]}</div>
+                <div class="stat-sub">Wallet query logs</div>
+            </div>
+        </a>
+
+        <a class="card card-link" href="/wallet-summary">
+            <div class="stat">
+                <div class="stat-top"><div><div class="stat-label">WALLET USERS</div></div><div class="icon">👤</div></div>
+                <div class="stat-value" style="color:#22e38e;">{stats["wallet_users"]}</div>
+                <div class="stat-sub">Users sent wallet addresses</div>
+            </div>
+        </a>
 
         <div class="card chart-card">
             <div class="section-title">📈 7 Day Volume</div>
@@ -3677,47 +4665,14 @@ body {{
             <div class="section-title">🛰 System Overview</div>
             <div class="section-sub">Core runtime information and public endpoints</div>
 
-            <div class="kv">
-                <div class="kv-key">Bot Username</div>
-                <div class="kv-val">@{safe_bot_username}</div>
-            </div>
-            <div class="kv">
-                <div class="kv-key">Webhook</div>
-                <div class="kv-val">{safe_webhook}</div>
-            </div>
-            <div class="kv">
-                <div class="kv-key">Payment Wallet</div>
-                <div class="kv-val">{PAYMENT_ADDRESS}</div>
-            </div>
-            <div class="kv">
-                <div class="kv-key">Logged In As</div>
-                <div class="kv-val">{admin_name}</div>
-            </div>
-
-            <div class="mini-grid">
-                <div class="mini">
-                    <div class="mini-label">Refresh</div>
-                    <div class="mini-value blue">20s</div>
-                </div>
-                <div class="mini">
-                    <div class="mini-label">Mode</div>
-                    <div class="mini-value green">LIVE</div>
-                </div>
-                <div class="mini">
-                    <div class="mini-label">SSL</div>
-                    <div class="mini-value yellow">ON</div>
-                </div>
-                <div class="mini">
-                    <div class="mini-label">Status</div>
-                    <div class="mini-value green">OK</div>
-                </div>
-            </div>
+            <div class="kv"><div class="kv-key">Bot Username</div><div class="kv-val">@{safe_bot_username}</div></div>
+            <div class="kv"><div class="kv-key">Webhook</div><div class="kv-val">{safe_webhook}</div></div>
+            <div class="kv"><div class="kv-key">Payment Wallet</div><div class="kv-val">{escape(PAYMENT_ADDRESS)}</div></div>
+            <div class="kv"><div class="kv-key">Logged In As</div><div class="kv-val">{admin_name}</div></div>
         </div>
     </div>
 
-    <div class="footer">
-        GOD MODE • Auto refresh every 20 seconds • Designed with premium dark glass UI
-    </div>
+    <div class="footer">GOD MODE • Auto refresh every 20 seconds</div>
 </div>
 
 <script>
@@ -3740,12 +4695,7 @@ new Chart(ctx, {{
             backgroundColor: gradient,
             fill: true,
             borderWidth: 3,
-            tension: 0.38,
-            pointRadius: 4,
-            pointHoverRadius: 6,
-            pointBackgroundColor: '#7ee7ff',
-            pointBorderWidth: 2,
-            pointBorderColor: '#102038'
+            tension: 0.38
         }}]
     }},
     options: {{
@@ -3770,40 +4720,524 @@ new Chart(ctx, {{
         }}
     }}
 }});
-
-document.querySelectorAll('.counter').forEach(el => {{
-    const target = parseInt(el.dataset.target || '0', 10);
-    let cur = 0;
-    const step = Math.max(1, Math.ceil(target / 35));
-    const timer = setInterval(() => {{
-        cur += step;
-        if (cur >= target) {{
-            cur = target;
-            clearInterval(timer);
-        }}
-        el.textContent = cur.toLocaleString();
-    }}, 22);
-}});
-
-document.querySelectorAll('.counter-float').forEach(el => {{
-    const target = parseFloat(el.dataset.target || '0');
-    let cur = 0;
-    const step = Math.max(0.01, target / 40);
-    const timer = setInterval(() => {{
-        cur += step;
-        if (cur >= target) {{
-            cur = target;
-            clearInterval(timer);
-        }}
-        el.textContent = cur.toFixed(2);
-    }}, 20);
-}});
-
 setTimeout(() => location.reload(), 20000);
 </script>
 </body>
 </html>
+"""
+
+# ================= WEB PAGES =================
+@app.get("/bots", response_class=HTMLResponse)
+async def bots_page(request: Request):
+    auth = guard(request)
+    if auth:
+        return auth
+
+    body = f"""
+    <div class="card">
+        <table>
+            <thead>
+                <tr>
+                    <th>Bot</th>
+                    <th>Username</th>
+                    <th>Status</th>
+                    <th>Webhook</th>
+                </tr>
+            </thead>
+            <tbody>
+                <tr>
+                    <td>God Bot</td>
+                    <td>@{escape(BOT_USERNAME or "-")}</td>
+                    <td><span class="badge">ONLINE</span></td>
+                    <td class="mono">{escape(f"{BOT_BASE_URL}/webhook" if BOT_BASE_URL else "Not configured")}</td>
+                </tr>
+            </tbody>
+        </table>
+    </div>
+    """
+    return HTMLResponse(simple_page("🤖 Bot Management", "Quản lý bot đang hoạt động", body))
+
+@app.get("/admins", response_class=HTMLResponse)
+async def admins_page(request: Request):
+    auth = guard(request)
+    if auth:
+        return auth
+
+    rows = get_all_admins()
+    html_rows = []
+
+    if BOT_OWNER_ID:
+        html_rows.append(f"<tr><td>{BOT_OWNER_ID}</td><td>owner</td><td><span class='badge'>ACTIVE</span></td></tr>")
+    if SUPER_ADMIN_ID and SUPER_ADMIN_ID != BOT_OWNER_ID:
+        html_rows.append(f"<tr><td>{SUPER_ADMIN_ID}</td><td>super(env)</td><td><span class='badge'>ACTIVE</span></td></tr>")
+
+    for uid, role in rows:
+        if uid in (BOT_OWNER_ID, SUPER_ADMIN_ID):
+            continue
+        html_rows.append(
+            f"<tr><td>{uid}</td><td>{escape(role)}</td><td><span class='badge'>ACTIVE</span></td></tr>"
+        )
+
+    body = f"""
+    <div class="card">
+        <table>
+            <thead><tr><th>User ID</th><th>Role</th><th>Status</th></tr></thead>
+            <tbody>{''.join(html_rows) if html_rows else '<tr><td colspan="3">No admins</td></tr>'}</tbody>
+        </table>
+    </div>
+    """
+    return HTMLResponse(simple_page("🛡 Admin Management", "Quản lý admin web", body))
+
+@app.get("/orders", response_class=HTMLResponse)
+async def orders_page(request: Request):
+    auth = guard(request)
+    if auth:
+        return auth
+
+    rows = get_rental_orders_by_status(None, limit=100)
+    trs = []
+    for row in rows:
+        order_code, user_id, username, full_name, category_title, plan_label, amount, st, created_at, paid_at, expires_at = row
+        badge_cls = "badge"
+        if st == "rejected":
+            badge_cls = "badge red"
+        elif st == "pending":
+            badge_cls = "badge yellow"
+
+        trs.append(
+            f"<tr>"
+            f"<td>{escape(order_code)}</td>"
+            f"<td>{user_id}</td>"
+            f"<td>@{escape(username or '-')}</td>"
+            f"<td>{escape(category_title or '-')}</td>"
+            f"<td>{escape(plan_label or '-')}</td>"
+            f"<td>{fmt_num(amount)}U</td>"
+            f"<td><span class='{badge_cls}'>{escape(st)}</span></td>"
+            f"<td>{fmt_ts(created_at)}</td>"
+            f"</tr>"
+        )
+
+    body = f"""
+    <div class="card">
+        <table>
+            <thead>
+                <tr>
+                    <th>Order</th>
+                    <th>User ID</th>
+                    <th>Username</th>
+                    <th>Category</th>
+                    <th>Plan</th>
+                    <th>Amount</th>
+                    <th>Status</th>
+                    <th>Created</th>
+                </tr>
+            </thead>
+            <tbody>{''.join(trs) if trs else '<tr><td colspan="8">No orders</td></tr>'}</tbody>
+        </table>
+    </div>
+    """
+    return HTMLResponse(simple_page("📦 Orders", "Quản lý đơn hàng / gia hạn", body))
+
+@app.get("/users", response_class=HTMLResponse)
+async def users_page(request: Request, page: int = 1, keyword: str = "", status: str = ""):
+    auth = guard(request)
+    if auth:
+        return auth
+
+    limit = 20
+    offset = (max(page, 1) - 1) * limit
+    rows = get_access_users_page(limit=limit, offset=offset, keyword=keyword or None, status=status or None)
+    total = count_access_users_filtered(keyword=keyword or None, status=status or None)
+    total_pages = max(1, (total + limit - 1) // limit)
+
+    trs = []
+    for user_id, username, granted_by, granted_at, expires_at in rows:
+        role = "VIP"
+        exp = "Permanent" if expires_at is None else fmt_ts(expires_at)
+        trs.append(
+            f"<tr>"
+            f"<td>{user_id}</td>"
+            f"<td>@{escape(username or '-')}</td>"
+            f"<td>{granted_by or '-'}</td>"
+            f"<td>{fmt_ts(granted_at)}</td>"
+            f"<td>{exp}</td>"
+            f"<td><span class='badge'>{role}</span></td>"
+            f"</tr>"
+        )
+
+    body = f"""
+    <div class="card">
+        <div class="grid">
+            <div class="stat"><div class="stat-label">Page</div><div class="stat-value">{page}</div></div>
+            <div class="stat"><div class="stat-label">Total Pages</div><div class="stat-value">{total_pages}</div></div>
+            <div class="stat"><div class="stat-label">Total Users</div><div class="stat-value">{total}</div></div>
+            <div class="stat"><div class="stat-label">Rows</div><div class="stat-value">{len(rows)}</div></div>
+        </div>
+    </div>
+
+    <div class="card">
+        <table>
+            <thead>
+                <tr>
+                    <th>User ID</th>
+                    <th>Username</th>
+                    <th>Granted By</th>
+                    <th>Granted At</th>
+                    <th>Expire At</th>
+                    <th>Role</th>
+                </tr>
+            </thead>
+            <tbody>{''.join(trs) if trs else '<tr><td colspan="6">No users</td></tr>'}</tbody>
+        </table>
+    </div>
+    """
+    return HTMLResponse(simple_page("👑 Users", "Quản lý user VIP", body))
+
+@app.get("/transactions", response_class=HTMLResponse)
+async def transactions_page(request: Request, date: str | None = None):
+    auth = guard(request)
+    if auth:
+        return auth
+
+    try:
+        if date:
+            dt = datetime.strptime(date, "%Y-%m-%d").replace(tzinfo=BEIJING_TZ)
+            start_ts = int(dt.replace(hour=0, minute=0, second=0, microsecond=0).timestamp())
+            end_ts = int((dt.replace(hour=0, minute=0, second=0, microsecond=0) + timedelta(days=1) - timedelta(seconds=1)).timestamp())
+        else:
+            start_ts, end_ts = day_range()
+    except Exception:
+        start_ts, end_ts = day_range()
+
+    trs = []
+    with get_db() as (_conn, cur):
+        cur.execute(
+            '''
+            SELECT id, chat_id, user_id, username, display_name, target_name, kind,
+                   raw_amount, unit_amount, rate_used, fee_used, note, original_text,
+                   created_at, undone
+            FROM transactions
+            WHERE created_at >= %s
+              AND created_at <= %s
+              AND COALESCE(undone, FALSE) = FALSE
+            ORDER BY created_at DESC, id DESC
+            LIMIT 200
+            ''',
+            (start_ts, end_ts)
+        )
+        rows = cur.fetchall()
+
+    for tx in rows:
+        tx_id, chat_id, user_id, username, display_name, target_name, kind, raw_amount, unit_amount, rate_used, fee_used, note, original_text, created_at, undone = tx
+        trs.append(
+            f"<tr>"
+            f"<td>{fmt_ts(created_at)}</td>"
+            f"<td>{chat_id}</td>"
+            f"<td>{escape(kind or '-')}</td>"
+            f"<td>{fmt_num(raw_amount)}</td>"
+            f"<td>{fmt_num(unit_amount)}U</td>"
+            f"<td>@{escape(username or '-')}</td>"
+            f"<td>{escape(target_name or '-')}</td>"
+            f"<td>{escape(note or '-')}</td>"
+            f"</tr>"
+        )
+
+    body = f"""
+    <div class="card">
+        <table>
+            <thead>
+                <tr>
+                    <th>Time</th>
+                    <th>Chat ID</th>
+                    <th>Type</th>
+                    <th>Raw</th>
+                    <th>U</th>
+                    <th>Username</th>
+                    <th>Target</th>
+                    <th>Note</th>
+                </tr>
+            </thead>
+            <tbody>{''.join(trs) if trs else '<tr><td colspan="8">No transactions</td></tr>'}</tbody>
+        </table>
+    </div>
+    """
+    return HTMLResponse(simple_page("💸 Transaction History", "Lịch sử giao dịch toàn hệ thống", body))
+
+@app.get("/groups", response_class=HTMLResponse)
+async def groups_page(request: Request):
+    auth = guard(request)
+    if auth:
+        return auth
+
+    rows = get_groups()
+    trs = []
+    for chat_id, title in rows:
+        trs.append(
+            f"<tr>"
+            f"<td>{escape(title or '-')}</td>"
+            f"<td>{chat_id}</td>"
+            f"<td><span class='badge'>ACTIVE</span></td>"
+            f"<td><a class='back' href='/group/{chat_id}'>History</a></td>"
+            f"</tr>"
+        )
+
+    body = f"""
+    <div class="card">
+        <table>
+            <thead><tr><th>Group</th><th>Chat ID</th><th>Status</th><th>Action</th></tr></thead>
+            <tbody>{''.join(trs) if trs else '<tr><td colspan="4">No groups</td></tr>'}</tbody>
+        </table>
+    </div>
+    """
+    return HTMLResponse(simple_page("👥 Group Management", "Quản lý nhóm Telegram", body))
+
+@app.get("/group/{chat_id}", response_class=HTMLResponse)
+async def group_history_page(chat_id: int, request: Request, date: str | None = None):
+    auth = guard(request)
+    if auth:
+        return auth
+
+    try:
+        if date:
+            dt = datetime.strptime(date, "%Y-%m-%d").replace(tzinfo=BEIJING_TZ)
+            start_ts = int(dt.replace(hour=0, minute=0, second=0, microsecond=0).timestamp())
+            end_ts = int((dt.replace(hour=0, minute=0, second=0, microsecond=0) + timedelta(days=1) - timedelta(seconds=1)).timestamp())
+        else:
+            start_ts, end_ts = day_range()
+    except Exception:
+        start_ts, end_ts = day_range()
+
+    txs = get_transactions(chat_id, start_ts=start_ts, end_ts=end_ts)
+    stats = summarize_transactions(txs)
+
+    trs = []
+    for tx in txs:
+        tx_id, chat_id, user_id, username, display_name, target_name, kind, raw_amount, unit_amount, rate_used, fee_used, note, original_text, created_at, undone = tx
+        trs.append(
+            f"<tr>"
+            f"<td>{fmt_ts(created_at)}</td>"
+            f"<td>{escape(kind or '-')}</td>"
+            f"<td>{fmt_num(raw_amount)}</td>"
+            f"<td>{fmt_num(unit_amount)}U</td>"
+            f"<td>{fmt_num(rate_used)}</td>"
+            f"<td>{fmt_num(fee_used)}%</td>"
+            f"<td>{escape(display_name or '-')}</td>"
+            f"<td>{escape(target_name or '-')}</td>"
+            f"<td>@{escape(username or '-')}</td>"
+            f"<td>{escape(note or '-')}</td>"
+            f"</tr>"
+        )
+
+    body = f"""
+    <div class="card">
+        <div class="grid">
+            <div class="stat"><div class="stat-label">总记录数</div><div class="stat-value">{len(txs)}</div></div>
+            <div class="stat"><div class="stat-label">正常入款</div><div class="stat-value">{fmt_num(stats['total_income_unit'])}U</div></div>
+            <div class="stat"><div class="stat-label">已下发</div><div class="stat-value">{fmt_num(stats['paid'])}U</div></div>
+            <div class="stat"><div class="stat-label">待下发</div><div class="stat-value">{fmt_num(stats['pending'])}U</div></div>
+        </div>
+    </div>
+
+    <div class="card">
+        <table>
+            <thead>
+                <tr>
+                    <th>Time</th>
+                    <th>Type</th>
+                    <th>Raw</th>
+                    <th>U</th>
+                    <th>Rate</th>
+                    <th>Fee</th>
+                    <th>By</th>
+                    <th>Target</th>
+                    <th>Username</th>
+                    <th>Note</th>
+                </tr>
+            </thead>
+            <tbody>{''.join(trs) if trs else '<tr><td colspan="10">No transactions</td></tr>'}</tbody>
+        </table>
+    </div>
+    """
+    return HTMLResponse(simple_page(f"📘 Group {chat_id}", "Lịch sử giao dịch nhóm", body))
+
+@app.get("/wallet-checks", response_class=HTMLResponse)
+async def wallet_checks_page(request: Request, page: int = 1):
+    auth = guard(request)
+    if auth:
+        return auth
+
+    limit = 30
+    offset = (max(page, 1) - 1) * limit
+    rows = get_wallet_checks_page(limit=limit, offset=offset)
+    total = count_wallet_checks()
+    total_pages = max(1, (total + limit - 1) // limit)
+
+    trs = []
+    for row in rows:
+        _id, chat_id, user_id, username, full_name, address, trx_balance, usdt_balance, tx_count, created_at = row
+        sender = full_name or username or str(user_id)
+        trs.append(
+            f"<tr>"
+            f"<td>{fmt_ts(created_at)}</td>"
+            f"<td>{chat_id}</td>"
+            f"<td>{user_id}</td>"
+            f"<td>{escape(sender)}</td>"
+            f"<td>@{escape(username or '-')}</td>"
+            f"<td class='mono'>{escape(address or '-')}</td>"
+            f"<td>{fmt_num(trx_balance)}</td>"
+            f"<td>{fmt_num(usdt_balance)}</td>"
+            f"<td>{tx_count if tx_count is not None else 'N/A'}</td>"
+            f"</tr>"
+        )
+
+    body = f"""
+    <div class="card">
+        <div class="grid">
+            <div class="stat"><div class="stat-label">Total Wallet Checks</div><div class="stat-value">{total}</div></div>
+            <div class="stat"><div class="stat-label">Current Page Rows</div><div class="stat-value">{len(rows)}</div></div>
+            <div class="stat"><div class="stat-label">Page</div><div class="stat-value">{page}</div></div>
+            <div class="stat"><div class="stat-label">Total Pages</div><div class="stat-value">{total_pages}</div></div>
+        </div>
+    </div>
+
+    <div class="card">
+        <table>
+            <thead>
+                <tr>
+                    <th>Time</th>
+                    <th>Chat ID</th>
+                    <th>User ID</th>
+                    <th>Sender</th>
+                    <th>Username</th>
+                    <th>Address</th>
+                    <th>TRX</th>
+                    <th>USDT</th>
+                    <th>TX Count</th>
+                </tr>
+            </thead>
+            <tbody>{''.join(trs) if trs else '<tr><td colspan="9">No wallet logs</td></tr>'}</tbody>
+        </table>
+    </div>
+    """
+    return HTMLResponse(simple_page("🔎 Wallet Check Logs", "Tất cả log user gửi ví", body))
+
+@app.get("/wallet-summary", response_class=HTMLResponse)
+async def wallet_summary_page(request: Request):
+    auth = guard(request)
+    if auth:
+        return auth
+
+    total_checks = 0
+    distinct_users = 0
+    distinct_groups = 0
+    user_rows = []
+    group_rows = []
+
+    try:
+        with get_db() as (_conn, cur):
+            cur.execute("SELECT COUNT(*) FROM wallet_checks")
+            total_checks = int(cur.fetchone()[0] or 0)
+
+            cur.execute("SELECT COUNT(DISTINCT user_id) FROM wallet_checks")
+            distinct_users = int(cur.fetchone()[0] or 0)
+
+            cur.execute("SELECT COUNT(DISTINCT chat_id) FROM wallet_checks")
+            distinct_groups = int(cur.fetchone()[0] or 0)
+
+            cur.execute(
+                '''
+                SELECT
+                    user_id,
+                    COALESCE(NULLIF(full_name, ''), NULLIF(username, ''), CAST(user_id AS TEXT)) AS sender,
+                    username,
+                    COUNT(*) AS total_times,
+                    MAX(created_at) AS last_time
+                FROM wallet_checks
+                GROUP BY user_id, sender, username
+                ORDER BY total_times DESC, last_time DESC
+                LIMIT 50
+                '''
+            )
+            user_rows = cur.fetchall()
+
+            cur.execute(
+                '''
+                SELECT
+                    chat_id,
+                    COUNT(*) AS total_times,
+                    COUNT(DISTINCT user_id) AS distinct_users_count,
+                    MAX(created_at) AS last_time
+                FROM wallet_checks
+                GROUP BY chat_id
+                ORDER BY total_times DESC, last_time DESC
+                LIMIT 50
+                '''
+            )
+            group_rows = cur.fetchall()
+
+    except Exception as e:
+        print("wallet_summary_page error:", e)
+
+    user_trs = []
+    for user_id, sender, username, total_times, last_time in user_rows:
+        user_trs.append(
+            f"<tr>"
+            f"<td>{user_id}</td>"
+            f"<td>{escape(sender or '-')}</td>"
+            f"<td>@{escape(username or '-')}</td>"
+            f"<td><span class='badge'>{total_times} 次</span></td>"
+            f"<td>{fmt_ts(last_time)}</td>"
+            f"</tr>"
+        )
+
+    group_trs = []
+    for chat_id, total_times, d_users, last_time in group_rows:
+        group_trs.append(
+            f"<tr>"
+            f"<td>{chat_id}</td>"
+            f"<td><span class='badge'>{total_times} 次</span></td>"
+            f"<td>{d_users}</td>"
+            f"<td>{fmt_ts(last_time)}</td>"
+            f"</tr>"
+        )
+
+    body = f"""
+    <div class="card">
+        <div class="grid">
+            <div class="stat"><div class="stat-label">Total Wallet Checks</div><div class="stat-value">{total_checks}</div></div>
+            <div class="stat"><div class="stat-label">Distinct Users</div><div class="stat-value">{distinct_users}</div></div>
+            <div class="stat"><div class="stat-label">Distinct Groups</div><div class="stat-value">{distinct_groups}</div></div>
+            <div class="stat"><div class="stat-label">Status</div><div class="stat-value">LIVE</div></div>
+        </div>
+    </div>
+
+    <div class="card">
+        <div style="font-size:22px;font-weight:800;margin-bottom:10px;">👤 User gửi ví bao nhiêu lần</div>
+        <table>
+            <thead><tr><th>User ID</th><th>Sender</th><th>Username</th><th>Total Times</th><th>Last Time</th></tr></thead>
+            <tbody>{''.join(user_trs) if user_trs else '<tr><td colspan="5">No user summary</td></tr>'}</tbody>
+        </table>
+    </div>
+
+    <div class="card">
+        <div style="font-size:22px;font-weight:800;margin-bottom:10px;">👥 Thống kê theo nhóm</div>
+        <table>
+            <thead><tr><th>Chat ID</th><th>Total Checks</th><th>Distinct Users</th><th>Last Time</th></tr></thead>
+            <tbody>{''.join(group_trs) if group_trs else '<tr><td colspan="4">No group summary</td></tr>'}</tbody>
+        </table>
+    </div>
+    """
+    return HTMLResponse(simple_page("📊 Wallet Summary", "Thống kê user gửi ví và theo nhóm", body))
+
+# ================= HEALTH =================
+@app.get("/healthz")
+async def healthz():
+    return {
+        "ok": True,
+        "bot_username": BOT_USERNAME,
+        "time": datetime.now(BEIJING_TZ).strftime("%Y-%m-%d %H:%M:%S"),
+    }
 
 # ================= RUN =================
 if __name__ == "__main__":
-   uvicorn.run(app, host="0.0.0.0", port=PORT)
+    uvicorn.run(app, host="0.0.0.0", port=PORT)
