@@ -9,15 +9,14 @@ from contextlib import asynccontextmanager
 from zoneinfo import ZoneInfo
 from urllib.parse import urlencode
 import traceback
-import sqlite3
 import json
 
 import requests
 import aiohttp
 from PIL import Image, ImageDraw, ImageFont
 
-from fastapi import FastAPI, Request, HTTPException
-from fastapi.responses import HTMLResponse
+from fastapi import FastAPI, Request, HTTPException, Form
+from fastapi.responses import HTMLResponse, RedirectResponse
 from aiogram import Bot, Dispatcher, types
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.fsm.context import FSMContext
@@ -70,6 +69,7 @@ from db import (
     get_access_user_by_id,
     has_expiry_notice,
     add_expiry_notice,
+    get_db,
 )
 
 # ================= ENV =================
@@ -83,6 +83,8 @@ SUPER_ADMIN_ID = int(os.getenv("SUPER_ADMIN_ID", "0") or 0)
 
 WEB_TOKEN = os.getenv("WEB_TOKEN", "").strip()
 TELEGRAM_SECRET_TOKEN = os.getenv("TELEGRAM_SECRET_TOKEN", "").strip()
+WELCOME_TEXT = os.getenv("WELCOME_TEXT", "欢迎 {name} 加入本群。").strip()
+WEB_ADMIN_NAME = os.getenv("WEB_ADMIN_NAME", "BOT 888").strip() or "BOT 888"
 
 BOT_BASE_URL = (
     os.getenv("BOT_BASE_URL")
@@ -2912,15 +2914,449 @@ def healthz():
 def home():
     return {"status": "running"}
     
+def get_web_admin_name():
+    return WEB_ADMIN_NAME or "BOT 888"
+
+
+def is_web_logged_in(request: Request):
+    session = request.cookies.get("god_session", "")
+    return session == WEB_TOKEN
+
+
+# ================= DASHBOARD DATA =================
+def dashboard_stats():
+    try:
+        stats = {}
+
+        with get_db() as (_conn, cur):
+            try:
+                cur.execute("SELECT COUNT(*) FROM access_users")
+                stats["vip_users"] = cur.fetchone()[0]
+            except Exception as e:
+                print("dashboard vip_users error:", e)
+                stats["vip_users"] = 0
+
+            try:
+                cur.execute("SELECT COUNT(*) FROM groups")
+                stats["groups"] = cur.fetchone()[0]
+            except Exception as e:
+                print("dashboard groups error:", e)
+                stats["groups"] = 0
+
+            try:
+                start_ts, end_ts = day_range()
+                cur.execute(
+                    """
+                    SELECT COUNT(*), COALESCE(SUM(unit_amount), 0)
+                    FROM transactions
+                    WHERE created_at >= %s
+                      AND created_at <= %s
+                      AND COALESCE(undone, FALSE) = FALSE
+                    """,
+                    (start_ts, end_ts)
+                )
+                row = cur.fetchone() or (0, 0)
+                stats["today_tx"] = int(row[0] or 0)
+                stats["today_amount"] = float(row[1] or 0)
+            except Exception as e:
+                print("dashboard today error:", e)
+                stats["today_tx"] = 0
+                stats["today_amount"] = 0
+
+            try:
+                cur.execute("SELECT COUNT(*) FROM rental_orders WHERE status = 'pending'")
+                stats["pending_orders"] = cur.fetchone()[0]
+            except Exception as e:
+                print("dashboard pending_orders error:", e)
+                stats["pending_orders"] = 0
+
+            try:
+                cur.execute("SELECT COUNT(*) FROM rental_orders")
+                stats["all_orders"] = cur.fetchone()[0]
+            except Exception as e:
+                print("dashboard all_orders error:", e)
+                stats["all_orders"] = 0
+
+        return stats
+
+    except Exception as e:
+        print("dashboard_stats error:", e)
+        return {
+            "vip_users": 0,
+            "groups": 0,
+            "today_tx": 0,
+            "today_amount": 0,
+            "pending_orders": 0,
+            "all_orders": 0,
+        }
+
+
+def dashboard_chart():
+    try:
+        labels = []
+        values = []
+
+        with get_db() as (_conn, cur):
+            for i in range(6, -1, -1):
+                d = datetime.now(BEIJING_TZ) - timedelta(days=i)
+                start = d.replace(hour=0, minute=0, second=0, microsecond=0)
+                end = start + timedelta(days=1)
+
+                cur.execute(
+                    """
+                    SELECT COALESCE(SUM(unit_amount), 0)
+                    FROM transactions
+                    WHERE created_at >= %s
+                      AND created_at < %s
+                      AND COALESCE(undone, FALSE) = FALSE
+                    """,
+                    (int(start.timestamp()), int(end.timestamp()))
+                )
+
+                amount = cur.fetchone()[0] or 0
+                labels.append(d.strftime("%m-%d"))
+                values.append(float(amount))
+
+        return labels, values
+
+    except Exception as e:
+        print("dashboard_chart error:", e)
+        return [], []
+
+
+# ================= PREMIUM LOGIN =================
+def premium_login_html(error_msg=""):
+    error_block = f'<div class="error-box">{escape(error_msg)}</div>' if error_msg else ""
+
+    return f"""
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>GOD Login</title>
+<style>
+:root {{
+    --bg: #070b17;
+    --panel: rgba(17, 25, 40, 0.78);
+    --line: rgba(255,255,255,0.08);
+    --text: #eaf2ff;
+    --muted: #8da2c0;
+    --blue: #3ab8ff;
+    --green: #22e38e;
+    --purple: #8b5cf6;
+    --red: #ff5d73;
+}}
+* {{
+    margin: 0;
+    padding: 0;
+    box-sizing: border-box;
+}}
+body {{
+    min-height: 100vh;
+    font-family: Inter, Arial, sans-serif;
+    color: var(--text);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 24px;
+    background:
+        radial-gradient(circle at top left, rgba(58,184,255,.18), transparent 28%),
+        radial-gradient(circle at top right, rgba(139,92,246,.16), transparent 24%),
+        radial-gradient(circle at bottom center, rgba(34,227,142,.10), transparent 28%),
+        linear-gradient(135deg, #060913 0%, #0a1020 45%, #070b17 100%);
+}}
+.wrap {{
+    width: 100%;
+    max-width: 1120px;
+    display: grid;
+    grid-template-columns: 1.15fr 0.85fr;
+    gap: 26px;
+}}
+.hero {{
+    position: relative;
+    overflow: hidden;
+    padding: 42px;
+    border-radius: 30px;
+    background: rgba(12, 19, 34, 0.78);
+    backdrop-filter: blur(18px);
+    border: 1px solid var(--line);
+    box-shadow: 0 25px 70px rgba(0,0,0,.42);
+}}
+.hero-badge {{
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    padding: 9px 14px;
+    border-radius: 999px;
+    background: rgba(58,184,255,.12);
+    border: 1px solid rgba(58,184,255,.25);
+    color: #9addff;
+    font-size: 13px;
+    margin-bottom: 22px;
+}}
+.hero-title {{
+    font-size: clamp(34px, 6vw, 62px);
+    font-weight: 900;
+    line-height: 1.02;
+    letter-spacing: -.03em;
+    margin-bottom: 16px;
+    background: linear-gradient(90deg, #8fe8ff 0%, #3ab8ff 30%, #a78bfa 65%, #22e38e 100%);
+    -webkit-background-clip: text;
+    -webkit-text-fill-color: transparent;
+}}
+.hero-sub {{
+    color: var(--muted);
+    font-size: 15px;
+    line-height: 1.7;
+    max-width: 560px;
+    margin-bottom: 28px;
+}}
+.feature-list {{
+    display: grid;
+    gap: 14px;
+}}
+.feature {{
+    display: flex;
+    gap: 14px;
+    align-items: flex-start;
+    background: rgba(255,255,255,.03);
+    border: 1px solid rgba(255,255,255,.06);
+    border-radius: 18px;
+    padding: 16px;
+}}
+.feature-icon {{
+    width: 42px;
+    height: 42px;
+    border-radius: 14px;
+    display: grid;
+    place-items: center;
+    font-size: 20px;
+    background: rgba(58,184,255,.12);
+    border: 1px solid rgba(58,184,255,.18);
+    flex-shrink: 0;
+}}
+.feature-title {{
+    font-size: 15px;
+    font-weight: 700;
+    margin-bottom: 5px;
+}}
+.feature-text {{
+    font-size: 13px;
+    color: var(--muted);
+    line-height: 1.6;
+}}
+.login-card {{
+    position: relative;
+    overflow: hidden;
+    padding: 34px;
+    border-radius: 30px;
+    background: rgba(14, 22, 38, 0.86);
+    backdrop-filter: blur(18px);
+    border: 1px solid var(--line);
+    box-shadow: 0 25px 70px rgba(0,0,0,.45);
+    display: flex;
+    flex-direction: column;
+    justify-content: center;
+}}
+.login-title {{
+    font-size: 34px;
+    font-weight: 900;
+    margin-bottom: 8px;
+}}
+.login-sub {{
+    color: var(--muted);
+    font-size: 14px;
+    line-height: 1.6;
+    margin-bottom: 24px;
+}}
+.label {{
+    display: block;
+    font-size: 13px;
+    color: #9bb0cc;
+    margin-bottom: 10px;
+    text-transform: uppercase;
+    letter-spacing: .10em;
+}}
+.input {{
+    width: 100%;
+    padding: 16px 18px;
+    border-radius: 18px;
+    border: 1px solid rgba(255,255,255,.08);
+    background: rgba(8, 13, 25, 0.88);
+    color: white;
+    font-size: 15px;
+    outline: none;
+    margin-bottom: 18px;
+}}
+.btn {{
+    width: 100%;
+    border: none;
+    padding: 16px 18px;
+    border-radius: 18px;
+    background: linear-gradient(90deg, #38bdf8 0%, #3b82f6 38%, #22c55e 100%);
+    color: white;
+    font-size: 16px;
+    font-weight: 800;
+    cursor: pointer;
+}}
+.error-box {{
+    margin-bottom: 16px;
+    padding: 14px 16px;
+    border-radius: 16px;
+    background: rgba(255,93,115,.10);
+    border: 1px solid rgba(255,93,115,.20);
+    color: #ff9baa;
+    font-size: 14px;
+}}
+.note {{
+    margin-top: 16px;
+    color: #6f87a8;
+    font-size: 13px;
+    line-height: 1.6;
+    text-align: center;
+}}
+.footer-badge {{
+    margin-top: 18px;
+    display: flex;
+    justify-content: center;
+    gap: 10px;
+    flex-wrap: wrap;
+}}
+.footer-pill {{
+    padding: 8px 12px;
+    border-radius: 999px;
+    font-size: 12px;
+    color: #b9cae2;
+    background: rgba(255,255,255,.04);
+    border: 1px solid rgba(255,255,255,.06);
+}}
+@media (max-width: 980px) {{
+    .wrap {{
+        grid-template-columns: 1fr;
+    }}
+}}
+</style>
+</head>
+<body>
+    <div class="wrap">
+        <div class="hero">
+            <div class="hero-badge">⚡ PREMIUM CONTROL ACCESS</div>
+            <div class="hero-title">GOD BOT<br>LOGIN PANEL</div>
+            <div class="hero-sub">
+                Đăng nhập để truy cập hệ thống dashboard premium, theo dõi bot Telegram,
+                giao dịch trong ngày, trạng thái đơn hàng và toàn bộ thông tin vận hành.
+            </div>
+
+            <div class="feature-list">
+                <div class="feature">
+                    <div class="feature-icon">📈</div>
+                    <div>
+                        <div class="feature-title">Real-time Dashboard</div>
+                        <div class="feature-text">Xem thống kê bot, volume 7 ngày, user VIP, nhóm và đơn hàng.</div>
+                    </div>
+                </div>
+
+                <div class="feature">
+                    <div class="feature-icon">🛡️</div>
+                    <div>
+                        <div class="feature-title">Secure Access</div>
+                        <div class="feature-text">Chỉ admin có mật khẩu mới vào được khu vực quản trị.</div>
+                    </div>
+                </div>
+
+                <div class="feature">
+                    <div class="feature-icon">🚀</div>
+                    <div>
+                        <div class="feature-title">Premium Interface</div>
+                        <div class="feature-text">Thiết kế dark glass đồng bộ hoàn toàn với GOD BOT Dashboard.</div>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <div class="login-card">
+            <div class="login-title">🔐 Đăng nhập</div>
+            <div class="login-sub">Nhập mật khẩu quản trị để tiếp tục vào dashboard.</div>
+
+            {error_block}
+
+            <form method="post" action="/login">
+                <label class="label">Admin Password</label>
+                <input class="input" type="password" name="password" placeholder="Nhập mật khẩu web..." required>
+                <button class="btn" type="submit">VÀO DASHBOARD</button>
+            </form>
+
+            <div class="note">
+                Mật khẩu đăng nhập là giá trị <b>WEB_TOKEN</b> trong file <b>.env</b>.
+            </div>
+
+            <div class="footer-badge">
+                <div class="footer-pill">Cloudflare SSL</div>
+                <div class="footer-pill">FastAPI</div>
+                <div class="footer-pill">Telegram Webhook</div>
+            </div>
+        </div>
+    </div>
+</body>
+</html>
+"""
+
+
+@app.get("/", response_class=HTMLResponse)
+def home():
+    return RedirectResponse(url="/login", status_code=302)
+
+
+@app.head("/")
+def home_head():
+    return {"ok": True}
+
+
+@app.get("/login", response_class=HTMLResponse)
+async def login_page(request: Request):
+    if is_web_logged_in(request):
+        return RedirectResponse(url="/dashboard", status_code=302)
+    return premium_login_html()
+
+
+@app.post("/login")
+async def login_submit(password: str = Form(...)):
+    if password != WEB_TOKEN:
+        return HTMLResponse(premium_login_html("❌ Sai mật khẩu đăng nhập"), status_code=401)
+
+    resp = RedirectResponse(url="/dashboard", status_code=302)
+    resp.set_cookie(
+        key="god_session",
+        value=WEB_TOKEN,
+        httponly=True,
+        samesite="lax",
+        secure=True,
+        max_age=7 * 24 * 3600,
+    )
+    return resp
+
+
+@app.get("/logout")
+async def logout():
+    resp = RedirectResponse(url="/login", status_code=302)
+    resp.delete_cookie("god_session")
+    return resp
+
+
 # ================= GOD DASHBOARD =================
 @app.get("/dashboard", response_class=HTMLResponse)
-async def dashboard():
+async def dashboard(request: Request):
+    if not is_web_logged_in(request):
+        return RedirectResponse(url="/login", status_code=302)
+
     stats = dashboard_stats()
     labels, values = dashboard_chart()
 
     safe_bot_username = BOT_USERNAME or "-"
     safe_webhook = f"{BOT_BASE_URL}/webhook" if BOT_BASE_URL else "Not configured"
     now_text = datetime.now(BEIJING_TZ).strftime("%Y-%m-%d %H:%M:%S")
+    admin_name = escape(get_web_admin_name())
 
     return f"""
 <!DOCTYPE html>
@@ -2934,29 +3370,21 @@ async def dashboard():
 :root {{
     --bg: #070b17;
     --panel: rgba(17, 25, 40, 0.72);
-    --panel-2: rgba(20, 32, 54, 0.82);
     --line: rgba(255,255,255,0.08);
     --text: #eaf2ff;
     --muted: #8da2c0;
     --blue: #3ab8ff;
-    --cyan: #45f3ff;
     --green: #22e38e;
     --yellow: #ffcc33;
     --red: #ff5d73;
     --purple: #8b5cf6;
     --shadow: 0 20px 50px rgba(0,0,0,.35);
 }}
-
 * {{
     margin: 0;
     padding: 0;
     box-sizing: border-box;
 }}
-
-html, body {{
-    min-height: 100%;
-}}
-
 body {{
     font-family: Inter, Arial, sans-serif;
     color: var(--text);
@@ -2968,39 +3396,23 @@ body {{
     padding: 28px;
     overflow-x: hidden;
 }}
-
-body::before {{
-    content: "";
-    position: fixed;
-    inset: 0;
-    background-image:
-        linear-gradient(rgba(255,255,255,0.025) 1px, transparent 1px),
-        linear-gradient(90deg, rgba(255,255,255,0.025) 1px, transparent 1px);
-    background-size: 32px 32px;
-    mask-image: radial-gradient(circle at center, black 45%, transparent 95%);
-    pointer-events: none;
-}}
-
 .container {{
     max-width: 1480px;
     margin: 0 auto;
 }}
-
 .hero {{
     display: flex;
     justify-content: space-between;
-    align-items: center;
+    align-items: flex-start;
     gap: 20px;
     margin-bottom: 24px;
     flex-wrap: wrap;
 }}
-
 .hero-left {{
     display: flex;
     flex-direction: column;
     gap: 10px;
 }}
-
 .badge {{
     display: inline-flex;
     align-items: center;
@@ -3013,7 +3425,6 @@ body::before {{
     color: #8ed9ff;
     font-size: 13px;
 }}
-
 .title {{
     font-size: clamp(32px, 5vw, 64px);
     font-weight: 900;
@@ -3023,19 +3434,17 @@ body::before {{
     -webkit-background-clip: text;
     -webkit-text-fill-color: transparent;
 }}
-
 .subtitle {{
     color: var(--muted);
     font-size: 15px;
 }}
-
 .hero-right {{
     display: flex;
     flex-wrap: wrap;
     gap: 12px;
     justify-content: flex-end;
+    align-items: flex-start;
 }}
-
 .pill {{
     padding: 12px 18px;
     border-radius: 999px;
@@ -3045,58 +3454,64 @@ body::before {{
     color: var(--text);
     font-size: 14px;
 }}
-
 .pill.online {{
     background: linear-gradient(135deg, rgba(34,227,142,.16), rgba(34,227,142,.08));
     color: #9ff3c8;
     border-color: rgba(34,227,142,.28);
 }}
-
+.pill a {{
+    color: white;
+    text-decoration: none;
+}}
+.welcome-box {{
+    width: 100%;
+    max-width: 420px;
+    background: rgba(17, 25, 40, 0.78);
+    border: 1px solid rgba(255,255,255,.08);
+    box-shadow: var(--shadow);
+    border-radius: 24px;
+    padding: 18px 20px;
+}}
+.welcome-line-1 {{
+    font-size: 20px;
+    font-weight: 800;
+    color: #7ee7ff;
+    margin-bottom: 6px;
+}}
+.welcome-line-2 {{
+    font-size: 15px;
+    color: #b4c6df;
+    margin-bottom: 8px;
+}}
+.welcome-line-3 {{
+    font-size: 14px;
+    color: #8ef0b9;
+}}
 .grid {{
     display: grid;
     grid-template-columns: repeat(12, 1fr);
     gap: 18px;
 }}
-
 .card {{
     position: relative;
     overflow: hidden;
     background: var(--panel);
     backdrop-filter: blur(18px);
-    -webkit-backdrop-filter: blur(18px);
-    border: 1px solid var(--line);
+    border: 1px solid rgba(255,255,255,.08);
     border-radius: 24px;
     box-shadow: var(--shadow);
 }}
-
-.card::before {{
-    content: "";
-    position: absolute;
-    inset: 0;
-    background: linear-gradient(135deg, rgba(255,255,255,.06), transparent 42%);
-    pointer-events: none;
-}}
-
 .stat {{
     grid-column: span 3;
     padding: 22px;
     min-height: 150px;
-    transition: transform .25s ease, box-shadow .25s ease, border-color .25s ease;
 }}
-
-.stat:hover {{
-    transform: translateY(-6px);
-    border-color: rgba(255,255,255,.16);
-    box-shadow: 0 26px 60px rgba(0,0,0,.42);
-}}
-
 .stat-top {{
     display: flex;
     justify-content: space-between;
     align-items: center;
     margin-bottom: 22px;
 }}
-
 .icon {{
     width: 48px;
     height: 48px;
@@ -3107,32 +3522,27 @@ body::before {{
     background: rgba(255,255,255,.06);
     border: 1px solid rgba(255,255,255,.08);
 }}
-
 .stat-label {{
     color: var(--muted);
     font-size: 13px;
     text-transform: uppercase;
     letter-spacing: .12em;
 }}
-
 .stat-value {{
     font-size: 42px;
     font-weight: 800;
     line-height: 1;
     margin-bottom: 12px;
 }}
-
 .stat-sub {{
     color: var(--muted);
     font-size: 13px;
 }}
-
 .blue {{ color: var(--blue); }}
 .green {{ color: var(--green); }}
 .yellow {{ color: var(--yellow); }}
 .red {{ color: var(--red); }}
 .purple {{ color: #b38cff; }}
-
 .progress {{
     width: 100%;
     height: 8px;
@@ -3141,37 +3551,31 @@ body::before {{
     overflow: hidden;
     margin-top: 14px;
 }}
-
 .progress > span {{
     display: block;
     height: 100%;
     border-radius: 999px;
     background: linear-gradient(90deg, rgba(58,184,255,.9), rgba(69,243,255,.95));
 }}
-
 .chart-card {{
     grid-column: span 8;
     padding: 24px;
     min-height: 420px;
 }}
-
 .side-card {{
     grid-column: span 4;
     padding: 24px;
 }}
-
 .section-title {{
     font-size: 20px;
     font-weight: 700;
     margin-bottom: 8px;
 }}
-
 .section-sub {{
     color: var(--muted);
     font-size: 14px;
     margin-bottom: 20px;
 }}
-
 .kv {{
     display: flex;
     justify-content: space-between;
@@ -3180,18 +3584,15 @@ body::before {{
     padding: 16px 0;
     border-bottom: 1px solid rgba(255,255,255,.06);
 }}
-
 .kv:last-child {{
     border-bottom: none;
 }}
-
 .kv-key {{
     color: var(--muted);
     font-size: 13px;
     text-transform: uppercase;
     letter-spacing: .08em;
 }}
-
 .kv-val {{
     text-align: right;
     font-size: 14px;
@@ -3199,63 +3600,33 @@ body::before {{
     word-break: break-all;
     max-width: 70%;
 }}
-
 .mini-grid {{
     display: grid;
     grid-template-columns: 1fr 1fr;
     gap: 14px;
     margin-top: 18px;
 }}
-
 .mini {{
     background: rgba(255,255,255,.03);
     border: 1px solid rgba(255,255,255,.06);
     border-radius: 18px;
     padding: 16px;
 }}
-
 .mini-label {{
     color: var(--muted);
     font-size: 12px;
     margin-bottom: 8px;
 }}
-
 .mini-value {{
     font-size: 22px;
     font-weight: 800;
 }}
-
 .footer {{
     margin-top: 22px;
     text-align: center;
     color: var(--muted);
     font-size: 13px;
 }}
-
-.glow-1, .glow-2 {{
-    position: absolute;
-    border-radius: 999px;
-    filter: blur(45px);
-    opacity: .18;
-    pointer-events: none;
-}}
-
-.glow-1 {{
-    width: 180px;
-    height: 180px;
-    background: #3ab8ff;
-    top: -70px;
-    right: -40px;
-}}
-
-.glow-2 {{
-    width: 150px;
-    height: 150px;
-    background: #8b5cf6;
-    bottom: -60px;
-    left: -30px;
-}}
-
 @media (max-width: 1180px) {{
     .stat {{
         grid-column: span 6;
@@ -3267,7 +3638,6 @@ body::before {{
         grid-column: span 12;
     }}
 }}
-
 @media (max-width: 720px) {{
     body {{
         padding: 16px;
@@ -3277,9 +3647,6 @@ body::before {{
     }}
     .title {{
         font-size: 38px;
-    }}
-    .hero-right {{
-        justify-content: flex-start;
     }}
 }}
 </style>
@@ -3293,19 +3660,24 @@ body::before {{
             <div class="title">GOD BOT DASHBOARD</div>
             <div class="subtitle">Real-time Telegram bot analytics • dark premium interface • auto refresh 20s</div>
         </div>
+
         <div class="hero-right">
             <div class="pill">🕒 {now_text}</div>
             <div class="pill online">● ONLINE</div>
+            <div class="pill"><a href="/logout">🚪 LOGOUT</a></div>
+
+            <div class="welcome-box">
+                <div class="welcome-line-1">Welcome Admin</div>
+                <div class="welcome-line-2">Xin chào Owner</div>
+                <div class="welcome-line-3">Logged in as {admin_name}</div>
+            </div>
         </div>
     </div>
 
     <div class="grid">
         <div class="card stat">
-            <div class="glow-1"></div>
             <div class="stat-top">
-                <div>
-                    <div class="stat-label">VIP USERS</div>
-                </div>
+                <div><div class="stat-label">VIP USERS</div></div>
                 <div class="icon">👑</div>
             </div>
             <div class="stat-value green counter" data-target="{stats["vip_users"]}">0</div>
@@ -3314,11 +3686,8 @@ body::before {{
         </div>
 
         <div class="card stat">
-            <div class="glow-1"></div>
             <div class="stat-top">
-                <div>
-                    <div class="stat-label">GROUPS</div>
-                </div>
+                <div><div class="stat-label">GROUPS</div></div>
                 <div class="icon">👥</div>
             </div>
             <div class="stat-value blue counter" data-target="{stats["groups"]}">0</div>
@@ -3327,11 +3696,8 @@ body::before {{
         </div>
 
         <div class="card stat">
-            <div class="glow-1"></div>
             <div class="stat-top">
-                <div>
-                    <div class="stat-label">TODAY TX</div>
-                </div>
+                <div><div class="stat-label">TODAY TX</div></div>
                 <div class="icon">📊</div>
             </div>
             <div class="stat-value yellow counter" data-target="{stats["today_tx"]}">0</div>
@@ -3340,11 +3706,8 @@ body::before {{
         </div>
 
         <div class="card stat">
-            <div class="glow-1"></div>
             <div class="stat-top">
-                <div>
-                    <div class="stat-label">TODAY U</div>
-                </div>
+                <div><div class="stat-label">TODAY U</div></div>
                 <div class="icon">💸</div>
             </div>
             <div class="stat-value green counter-float" data-target="{float(stats["today_amount"]):.2f}">0.00</div>
@@ -3353,11 +3716,8 @@ body::before {{
         </div>
 
         <div class="card stat">
-            <div class="glow-2"></div>
             <div class="stat-top">
-                <div>
-                    <div class="stat-label">PENDING ORDERS</div>
-                </div>
+                <div><div class="stat-label">PENDING ORDERS</div></div>
                 <div class="icon">⏳</div>
             </div>
             <div class="stat-value red counter" data-target="{stats["pending_orders"]}">0</div>
@@ -3366,11 +3726,8 @@ body::before {{
         </div>
 
         <div class="card stat">
-            <div class="glow-2"></div>
             <div class="stat-top">
-                <div>
-                    <div class="stat-label">ALL ORDERS</div>
-                </div>
+                <div><div class="stat-label">ALL ORDERS</div></div>
                 <div class="icon">📦</div>
             </div>
             <div class="stat-value purple counter" data-target="{stats["all_orders"]}">0</div>
@@ -3401,8 +3758,8 @@ body::before {{
                 <div class="kv-val">{PAYMENT_ADDRESS}</div>
             </div>
             <div class="kv">
-                <div class="kv-key">Server</div>
-                <div class="kv-val">DigitalOcean / FastAPI / PostgreSQL</div>
+                <div class="kv-key">Logged In As</div>
+                <div class="kv-val">{admin_name}</div>
             </div>
 
             <div class="mini-grid">
@@ -3525,7 +3882,6 @@ setTimeout(() => location.reload(), 20000);
 </script>
 </body>
 </html>
-"""
     
 # ================= RUN =================
 if __name__ == "__main__":
