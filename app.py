@@ -9,12 +9,15 @@ from contextlib import asynccontextmanager
 from zoneinfo import ZoneInfo
 from urllib.parse import urlencode
 import traceback
+import sqlite3
+import json
 
 import requests
 import aiohttp
 from PIL import Image, ImageDraw, ImageFont
 
 from fastapi import FastAPI, Request, HTTPException
+from fastapi.responses import HTMLResponse
 from aiogram import Bot, Dispatcher, types
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.fsm.context import FSMContext
@@ -2908,7 +2911,622 @@ def healthz():
 @app.head("/")
 def home():
     return {"status": "running"}
+    
+# ================= GOD DASHBOARD =================
+@app.get("/dashboard", response_class=HTMLResponse)
+async def dashboard():
+    stats = dashboard_stats()
+    labels, values = dashboard_chart()
 
+    safe_bot_username = BOT_USERNAME or "-"
+    safe_webhook = f"{BOT_BASE_URL}/webhook" if BOT_BASE_URL else "Not configured"
+    now_text = datetime.now(BEIJING_TZ).strftime("%Y-%m-%d %H:%M:%S")
+
+    return f"""
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>GOD BOT Dashboard</title>
+<script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+<style>
+:root {{
+    --bg: #070b17;
+    --panel: rgba(17, 25, 40, 0.72);
+    --panel-2: rgba(20, 32, 54, 0.82);
+    --line: rgba(255,255,255,0.08);
+    --text: #eaf2ff;
+    --muted: #8da2c0;
+    --blue: #3ab8ff;
+    --cyan: #45f3ff;
+    --green: #22e38e;
+    --yellow: #ffcc33;
+    --red: #ff5d73;
+    --purple: #8b5cf6;
+    --shadow: 0 20px 50px rgba(0,0,0,.35);
+}}
+
+* {{
+    margin: 0;
+    padding: 0;
+    box-sizing: border-box;
+}}
+
+html, body {{
+    min-height: 100%;
+}}
+
+body {{
+    font-family: Inter, Arial, sans-serif;
+    color: var(--text);
+    background:
+        radial-gradient(circle at top left, rgba(58,184,255,.18), transparent 30%),
+        radial-gradient(circle at top right, rgba(139,92,246,.14), transparent 25%),
+        radial-gradient(circle at bottom center, rgba(34,227,142,.12), transparent 30%),
+        linear-gradient(135deg, #060913 0%, #0a1020 45%, #070b17 100%);
+    padding: 28px;
+    overflow-x: hidden;
+}}
+
+body::before {{
+    content: "";
+    position: fixed;
+    inset: 0;
+    background-image:
+        linear-gradient(rgba(255,255,255,0.025) 1px, transparent 1px),
+        linear-gradient(90deg, rgba(255,255,255,0.025) 1px, transparent 1px);
+    background-size: 32px 32px;
+    mask-image: radial-gradient(circle at center, black 45%, transparent 95%);
+    pointer-events: none;
+}}
+
+.container {{
+    max-width: 1480px;
+    margin: 0 auto;
+}}
+
+.hero {{
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    gap: 20px;
+    margin-bottom: 24px;
+    flex-wrap: wrap;
+}}
+
+.hero-left {{
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+}}
+
+.badge {{
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    width: fit-content;
+    padding: 8px 14px;
+    border-radius: 999px;
+    background: rgba(58,184,255,.12);
+    border: 1px solid rgba(58,184,255,.25);
+    color: #8ed9ff;
+    font-size: 13px;
+}}
+
+.title {{
+    font-size: clamp(32px, 5vw, 64px);
+    font-weight: 900;
+    letter-spacing: -.03em;
+    line-height: 1;
+    background: linear-gradient(90deg, #8fe8ff 0%, #3ab8ff 30%, #a78bfa 65%, #22e38e 100%);
+    -webkit-background-clip: text;
+    -webkit-text-fill-color: transparent;
+}}
+
+.subtitle {{
+    color: var(--muted);
+    font-size: 15px;
+}}
+
+.hero-right {{
+    display: flex;
+    flex-wrap: wrap;
+    gap: 12px;
+    justify-content: flex-end;
+}}
+
+.pill {{
+    padding: 12px 18px;
+    border-radius: 999px;
+    background: rgba(17, 25, 40, 0.78);
+    border: 1px solid var(--line);
+    box-shadow: var(--shadow);
+    color: var(--text);
+    font-size: 14px;
+}}
+
+.pill.online {{
+    background: linear-gradient(135deg, rgba(34,227,142,.16), rgba(34,227,142,.08));
+    color: #9ff3c8;
+    border-color: rgba(34,227,142,.28);
+}}
+
+.grid {{
+    display: grid;
+    grid-template-columns: repeat(12, 1fr);
+    gap: 18px;
+}}
+
+.card {{
+    position: relative;
+    overflow: hidden;
+    background: var(--panel);
+    backdrop-filter: blur(18px);
+    -webkit-backdrop-filter: blur(18px);
+    border: 1px solid var(--line);
+    border-radius: 24px;
+    box-shadow: var(--shadow);
+}}
+
+.card::before {{
+    content: "";
+    position: absolute;
+    inset: 0;
+    background: linear-gradient(135deg, rgba(255,255,255,.06), transparent 42%);
+    pointer-events: none;
+}}
+
+.stat {{
+    grid-column: span 3;
+    padding: 22px;
+    min-height: 150px;
+    transition: transform .25s ease, box-shadow .25s ease, border-color .25s ease;
+}}
+
+.stat:hover {{
+    transform: translateY(-6px);
+    border-color: rgba(255,255,255,.16);
+    box-shadow: 0 26px 60px rgba(0,0,0,.42);
+}}
+
+.stat-top {{
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-bottom: 22px;
+}}
+
+.icon {{
+    width: 48px;
+    height: 48px;
+    border-radius: 16px;
+    display: grid;
+    place-items: center;
+    font-size: 22px;
+    background: rgba(255,255,255,.06);
+    border: 1px solid rgba(255,255,255,.08);
+}}
+
+.stat-label {{
+    color: var(--muted);
+    font-size: 13px;
+    text-transform: uppercase;
+    letter-spacing: .12em;
+}}
+
+.stat-value {{
+    font-size: 42px;
+    font-weight: 800;
+    line-height: 1;
+    margin-bottom: 12px;
+}}
+
+.stat-sub {{
+    color: var(--muted);
+    font-size: 13px;
+}}
+
+.blue {{ color: var(--blue); }}
+.green {{ color: var(--green); }}
+.yellow {{ color: var(--yellow); }}
+.red {{ color: var(--red); }}
+.purple {{ color: #b38cff; }}
+
+.progress {{
+    width: 100%;
+    height: 8px;
+    border-radius: 999px;
+    background: rgba(255,255,255,.05);
+    overflow: hidden;
+    margin-top: 14px;
+}}
+
+.progress > span {{
+    display: block;
+    height: 100%;
+    border-radius: 999px;
+    background: linear-gradient(90deg, rgba(58,184,255,.9), rgba(69,243,255,.95));
+}}
+
+.chart-card {{
+    grid-column: span 8;
+    padding: 24px;
+    min-height: 420px;
+}}
+
+.side-card {{
+    grid-column: span 4;
+    padding: 24px;
+}}
+
+.section-title {{
+    font-size: 20px;
+    font-weight: 700;
+    margin-bottom: 8px;
+}}
+
+.section-sub {{
+    color: var(--muted);
+    font-size: 14px;
+    margin-bottom: 20px;
+}}
+
+.kv {{
+    display: flex;
+    justify-content: space-between;
+    align-items: flex-start;
+    gap: 18px;
+    padding: 16px 0;
+    border-bottom: 1px solid rgba(255,255,255,.06);
+}}
+
+.kv:last-child {{
+    border-bottom: none;
+}}
+
+.kv-key {{
+    color: var(--muted);
+    font-size: 13px;
+    text-transform: uppercase;
+    letter-spacing: .08em;
+}}
+
+.kv-val {{
+    text-align: right;
+    font-size: 14px;
+    color: var(--text);
+    word-break: break-all;
+    max-width: 70%;
+}}
+
+.mini-grid {{
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 14px;
+    margin-top: 18px;
+}}
+
+.mini {{
+    background: rgba(255,255,255,.03);
+    border: 1px solid rgba(255,255,255,.06);
+    border-radius: 18px;
+    padding: 16px;
+}}
+
+.mini-label {{
+    color: var(--muted);
+    font-size: 12px;
+    margin-bottom: 8px;
+}}
+
+.mini-value {{
+    font-size: 22px;
+    font-weight: 800;
+}}
+
+.footer {{
+    margin-top: 22px;
+    text-align: center;
+    color: var(--muted);
+    font-size: 13px;
+}}
+
+.glow-1, .glow-2 {{
+    position: absolute;
+    border-radius: 999px;
+    filter: blur(45px);
+    opacity: .18;
+    pointer-events: none;
+}}
+
+.glow-1 {{
+    width: 180px;
+    height: 180px;
+    background: #3ab8ff;
+    top: -70px;
+    right: -40px;
+}}
+
+.glow-2 {{
+    width: 150px;
+    height: 150px;
+    background: #8b5cf6;
+    bottom: -60px;
+    left: -30px;
+}}
+
+@media (max-width: 1180px) {{
+    .stat {{
+        grid-column: span 6;
+    }}
+    .chart-card {{
+        grid-column: span 12;
+    }}
+    .side-card {{
+        grid-column: span 12;
+    }}
+}}
+
+@media (max-width: 720px) {{
+    body {{
+        padding: 16px;
+    }}
+    .stat {{
+        grid-column: span 12;
+    }}
+    .title {{
+        font-size: 38px;
+    }}
+    .hero-right {{
+        justify-content: flex-start;
+    }}
+}}
+</style>
+</head>
+<body>
+<div class="container">
+
+    <div class="hero">
+        <div class="hero-left">
+            <div class="badge">⚡ PREMIUM CONTROL PANEL</div>
+            <div class="title">GOD BOT DASHBOARD</div>
+            <div class="subtitle">Real-time Telegram bot analytics • dark premium interface • auto refresh 20s</div>
+        </div>
+        <div class="hero-right">
+            <div class="pill">🕒 {now_text}</div>
+            <div class="pill online">● ONLINE</div>
+        </div>
+    </div>
+
+    <div class="grid">
+        <div class="card stat">
+            <div class="glow-1"></div>
+            <div class="stat-top">
+                <div>
+                    <div class="stat-label">VIP USERS</div>
+                </div>
+                <div class="icon">👑</div>
+            </div>
+            <div class="stat-value green counter" data-target="{stats["vip_users"]}">0</div>
+            <div class="stat-sub">Premium access accounts</div>
+            <div class="progress"><span style="width:{min(100, max(8, stats["vip_users"] * 8))}%"></span></div>
+        </div>
+
+        <div class="card stat">
+            <div class="glow-1"></div>
+            <div class="stat-top">
+                <div>
+                    <div class="stat-label">GROUPS</div>
+                </div>
+                <div class="icon">👥</div>
+            </div>
+            <div class="stat-value blue counter" data-target="{stats["groups"]}">0</div>
+            <div class="stat-sub">Connected Telegram groups</div>
+            <div class="progress"><span style="width:{min(100, max(8, stats["groups"] * 10))}%"></span></div>
+        </div>
+
+        <div class="card stat">
+            <div class="glow-1"></div>
+            <div class="stat-top">
+                <div>
+                    <div class="stat-label">TODAY TX</div>
+                </div>
+                <div class="icon">📊</div>
+            </div>
+            <div class="stat-value yellow counter" data-target="{stats["today_tx"]}">0</div>
+            <div class="stat-sub">Transactions recorded today</div>
+            <div class="progress"><span style="width:{min(100, max(8, stats["today_tx"] * 6))}%"></span></div>
+        </div>
+
+        <div class="card stat">
+            <div class="glow-1"></div>
+            <div class="stat-top">
+                <div>
+                    <div class="stat-label">TODAY U</div>
+                </div>
+                <div class="icon">💸</div>
+            </div>
+            <div class="stat-value green counter-float" data-target="{float(stats["today_amount"]):.2f}">0.00</div>
+            <div class="stat-sub">Total volume today</div>
+            <div class="progress"><span style="width:{min(100, max(8, int(float(stats["today_amount"]) if stats["today_amount"] else 0)))}%"></span></div>
+        </div>
+
+        <div class="card stat">
+            <div class="glow-2"></div>
+            <div class="stat-top">
+                <div>
+                    <div class="stat-label">PENDING ORDERS</div>
+                </div>
+                <div class="icon">⏳</div>
+            </div>
+            <div class="stat-value red counter" data-target="{stats["pending_orders"]}">0</div>
+            <div class="stat-sub">Orders waiting for approval</div>
+            <div class="progress"><span style="width:{min(100, max(8, stats["pending_orders"] * 15))}%; background:linear-gradient(90deg, rgba(255,93,115,.9), rgba(255,140,102,.95));"></span></div>
+        </div>
+
+        <div class="card stat">
+            <div class="glow-2"></div>
+            <div class="stat-top">
+                <div>
+                    <div class="stat-label">ALL ORDERS</div>
+                </div>
+                <div class="icon">📦</div>
+            </div>
+            <div class="stat-value purple counter" data-target="{stats["all_orders"]}">0</div>
+            <div class="stat-sub">Total rental / renew history</div>
+            <div class="progress"><span style="width:{min(100, max(8, stats["all_orders"] * 8))}%; background:linear-gradient(90deg, rgba(139,92,246,.9), rgba(59,130,246,.95));"></span></div>
+        </div>
+
+        <div class="card chart-card">
+            <div class="section-title">📈 7 Day Volume</div>
+            <div class="section-sub">Transaction volume trend for the last 7 days</div>
+            <canvas id="myChart" height="120"></canvas>
+        </div>
+
+        <div class="card side-card">
+            <div class="section-title">🛰 System Overview</div>
+            <div class="section-sub">Core runtime information and public endpoints</div>
+
+            <div class="kv">
+                <div class="kv-key">Bot Username</div>
+                <div class="kv-val">@{safe_bot_username}</div>
+            </div>
+            <div class="kv">
+                <div class="kv-key">Webhook</div>
+                <div class="kv-val">{safe_webhook}</div>
+            </div>
+            <div class="kv">
+                <div class="kv-key">Payment Wallet</div>
+                <div class="kv-val">{PAYMENT_ADDRESS}</div>
+            </div>
+            <div class="kv">
+                <div class="kv-key">Server</div>
+                <div class="kv-val">DigitalOcean / FastAPI / PostgreSQL</div>
+            </div>
+
+            <div class="mini-grid">
+                <div class="mini">
+                    <div class="mini-label">Refresh</div>
+                    <div class="mini-value blue">20s</div>
+                </div>
+                <div class="mini">
+                    <div class="mini-label">Mode</div>
+                    <div class="mini-value green">LIVE</div>
+                </div>
+                <div class="mini">
+                    <div class="mini-label">SSL</div>
+                    <div class="mini-value yellow">ON</div>
+                </div>
+                <div class="mini">
+                    <div class="mini-label">Status</div>
+                    <div class="mini-value green">OK</div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <div class="footer">
+        GOD MODE • Auto refresh every 20 seconds • Designed with premium dark glass UI
+    </div>
+</div>
+
+<script>
+const labels = {json.dumps(labels, ensure_ascii=False)};
+const values = {json.dumps(values)};
+
+const ctx = document.getElementById('myChart').getContext('2d');
+const gradient = ctx.createLinearGradient(0, 0, 0, 320);
+gradient.addColorStop(0, 'rgba(58,184,255,0.38)');
+gradient.addColorStop(1, 'rgba(58,184,255,0.02)');
+
+new Chart(ctx, {{
+    type: 'line',
+    data: {{
+        labels: labels,
+        datasets: [{{
+            label: '7 Day Volume',
+            data: values,
+            borderColor: '#43c6ff',
+            backgroundColor: gradient,
+            fill: true,
+            borderWidth: 3,
+            tension: 0.38,
+            pointRadius: 4,
+            pointHoverRadius: 6,
+            pointBackgroundColor: '#7ee7ff',
+            pointBorderWidth: 2,
+            pointBorderColor: '#102038'
+        }}]
+    }},
+    options: {{
+        responsive: true,
+        maintainAspectRatio: false,
+        plugins: {{
+            legend: {{
+                labels: {{
+                    color: '#d8e6ff',
+                    font: {{
+                        size: 13
+                    }}
+                }}
+            }}
+        }},
+        scales: {{
+            x: {{
+                grid: {{
+                    color: 'rgba(255,255,255,0.05)'
+                }},
+                ticks: {{
+                    color: '#9fb3d1'
+                }}
+            }},
+            y: {{
+                grid: {{
+                    color: 'rgba(255,255,255,0.05)'
+                }},
+                ticks: {{
+                    color: '#9fb3d1'
+                }}
+            }}
+        }}
+    }}
+}});
+
+document.querySelectorAll('.counter').forEach(el => {{
+    const target = parseInt(el.dataset.target || '0', 10);
+    let cur = 0;
+    const step = Math.max(1, Math.ceil(target / 35));
+    const timer = setInterval(() => {{
+        cur += step;
+        if (cur >= target) {{
+            cur = target;
+            clearInterval(timer);
+        }}
+        el.textContent = cur.toLocaleString();
+    }}, 22);
+}});
+
+document.querySelectorAll('.counter-float').forEach(el => {{
+    const target = parseFloat(el.dataset.target || '0');
+    let cur = 0;
+    const step = Math.max(0.01, target / 40);
+    const timer = setInterval(() => {{
+        cur += step;
+        if (cur >= target) {{
+            cur = target;
+            clearInterval(timer);
+        }}
+        el.textContent = cur.toFixed(2);
+    }}, 20);
+}});
+
+setTimeout(() => location.reload(), 20000);
+</script>
+</body>
+</html>
+"""
+    
 # ================= RUN =================
 if __name__ == "__main__":
    uvicorn.run(app, host="0.0.0.0", port=PORT)
