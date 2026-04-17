@@ -85,6 +85,7 @@ WEB_TOKEN = os.getenv("WEB_TOKEN", "").strip()
 TELEGRAM_SECRET_TOKEN = os.getenv("TELEGRAM_SECRET_TOKEN", "").strip()
 WELCOME_TEXT = os.getenv("WELCOME_TEXT", "欢迎 {name} 加入本群。").strip()
 WEB_ADMIN_NAME = os.getenv("WEB_ADMIN_NAME", "BOT 888").strip() or "BOT 888"
+WEB_ADMIN_NAME = os.getenv("WEB_ADMIN_NAME", "BOT 888").strip() or "BOT 888"
 
 BOT_BASE_URL = (
     os.getenv("BOT_BASE_URL")
