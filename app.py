@@ -4259,8 +4259,8 @@ body {{
 def home():
     return RedirectResponse(url="/login", status_code=302)
 
-@app.head("/")
-def home_head():
+@app.get("/health")
+def health():
     return {"ok": True}
 
 @app.get("/login", response_class=HTMLResponse)
