@@ -1100,6 +1100,46 @@ def group_feature_text():
         "• 寄存：<code>P+2000</code>"
     )
 
+def extract_username_only(text: str):
+    text = (text or "").strip()
+    if not text:
+        return None
+    if text.startswith("@"):
+        text = text[1:].strip()
+    if re.fullmatch(r"[A-Za-z0-9_]{4,}", text or ""):
+        return text.lower()
+    return None
+
+
+def find_member_by_username(chat_id, username: str):
+    username = (username or "").strip().lower()
+    if not username:
+        return None
+
+    members = get_members(chat_id) or []
+    for m in members:
+        try:
+            if isinstance(m, dict):
+                mid = int(m.get("user_id") or 0)
+                mun = (m.get("username") or "").strip().lower()
+                mname = (m.get("full_name") or "").strip()
+            else:
+                mid = int(m[1])
+                mun = (m[2] or "").strip().lower()
+                mname = (m[3] or "").strip()
+
+            if mun == username:
+                return {
+                    "user_id": mid,
+                    "username": mun,
+                    "full_name": mname,
+                }
+        except Exception:
+            continue
+
+    return None
+
+
 @dp.message(AdminFSM.waiting_add_admin)
 async def process_add_admin(message: types.Message, state: FSMContext):
     if should_ignore_message(message):
