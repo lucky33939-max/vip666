@@ -331,10 +331,6 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(lifespan=lifespan)
 
-@app.get("/health")
-async def health():
-    return {"ok": True}
-    
 # ================= STATES =================
 class BroadcastFSM(StatesGroup):
     waiting_content = State()
