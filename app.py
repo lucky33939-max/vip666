@@ -548,6 +548,45 @@ async def send_long_text(chat_id, text, reply_markup=None, parse_mode="HTML"):
             parse_mode=parse_mode,
         )
 
+def extract_username_only(text: str):
+    text = (text or "").strip()
+    if not text:
+        return None
+    if text.startswith("@"):
+        text = text[1:].strip()
+    if re.fullmatch(r"[A-Za-z0-9_]{4,}", text or ""):
+        return text.lower()
+    return None
+
+
+def find_member_by_username(chat_id, username: str):
+    username = (username or "").strip().lower()
+    if not username:
+        return None
+
+    members = get_members(chat_id) or []
+    for m in members:
+        try:
+            if isinstance(m, dict):
+                mid = int(m.get("user_id") or 0)
+                mun = (m.get("username") or "").strip().lower()
+                mname = (m.get("full_name") or "").strip()
+            else:
+                mid = int(m[1])
+                mun = (m[2] or "").strip().lower()
+                mname = (m[3] or "").strip()
+
+            if mun == username:
+                return {
+                    "user_id": mid,
+                    "username": mun,
+                    "full_name": mname,
+                }
+        except Exception:
+            continue
+
+    return None
+
 def day_range(ts=None):
     dt = datetime.now(BEIJING_TZ) if ts is None else datetime.fromtimestamp(int(ts), BEIJING_TZ)
     start = dt.replace(hour=0, minute=0, second=0, microsecond=0)
@@ -1061,6 +1100,103 @@ def group_feature_text():
         "• 寄存：<code>P+2000</code>"
     )
 
+@dp.message(AdminFSM.waiting_add_admin)
+async def process_add_admin(message: types.Message, state: FSMContext):
+    if should_ignore_message(message):
+        return
+
+    if not can_manage_admins(message.from_user.id):
+        await message.answer("❌ 无权限")
+        await state.clear()
+        return
+
+    ensure_group(message)
+
+    username = extract_username_only(message.text or "")
+    if not username:
+        await message.answer(
+            "请发送要添加的操作员用户名。\n\n"
+            "格式：@username\n\n"
+            "例如：@abc123"
+        )
+        return
+
+    target = find_member_by_username(message.chat.id, username)
+    if not target:
+        await message.answer(
+            "❌ 未找到该用户。\n\n"
+            "请确认：\n"
+            "1. 对方已经在群里发过言\n"
+            "2. 用户名输入正确\n"
+            "3. 格式必须是 @username"
+        )
+        return
+
+    target_id = int(target["user_id"])
+    target_username = target.get("username") or ""
+    target_name = target.get("full_name") or ""
+
+    add_admin(target_id, "admin")
+    await state.clear()
+
+    await message.answer(
+        "✅ 已添加操作员\n"
+        f"用户名：@{escape(target_username)}\n"
+        f"姓名：{escape(target_name) if target_name else '未设置'}\n"
+        f"ID：<code>{target_id}</code>\n\n"
+        "现在对方可以使用机器人的操作功能。",
+        parse_mode="HTML",
+    )
+
+    @dp.message(AdminFSM.waiting_del_admin)
+async def process_del_admin(message: types.Message, state: FSMContext):
+    if should_ignore_message(message):
+        return
+
+    if not can_manage_admins(message.from_user.id):
+        await message.answer("❌ 无权限")
+        await state.clear()
+        return
+
+    ensure_group(message)
+
+    username = extract_username_only(message.text or "")
+    if not username:
+        await message.answer(
+            "请发送要删除的操作员用户名。\n\n"
+            "格式：@username\n\n"
+            "例如：@abc123"
+        )
+        return
+
+    target = find_member_by_username(message.chat.id, username)
+    if not target:
+        await message.answer(
+            "❌ 未找到该用户。\n\n"
+            "请确认用户名正确，且对方曾在本群发言。"
+        )
+        return
+
+    target_id = int(target["user_id"])
+    remove_admin(target_id)
+    await state.clear()
+
+    await message.answer(
+        f"✅ 已删除操作员\n用户名：@{escape(target.get('username') or username)}\nID：<code>{target_id}</code>",
+        parse_mode="HTML",
+    )
+
+    await message.answer(
+    "请发送要添加的操作员用户名。\n\n格式：@username"
+)
+
+    await message.answer(
+    "请发送要删除的操作员用户名。\n\n格式：@username"
+)
+
+    def can_use_bot_ops(user_id):
+    return get_user_role(user_id) in ("owner", "super", "admin")
+    
 # ================= REPORT HELPERS =================
 def split_target_prefix(text):
     t = (text or "").strip()
