@@ -16,8 +16,9 @@ import aiohttp
 from PIL import Image, ImageDraw, ImageFont
 
 from fastapi import FastAPI, Request, HTTPException, Form, Query
-from fastapi.responses import HTMLResponse, RedirectResponse
+from fastapi.responses import HTMLResponse, RedirectResponse, JSONResponse
 from aiogram import Bot, Dispatcher, types
+from aiogram.types import Update
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import StatesGroup, State
@@ -328,9 +329,31 @@ async def lifespan(app: FastAPI):
             await bot.session.close()
         except Exception as e:
             print("bot session close error:", e)
-
 app = FastAPI(lifespan=lifespan)
 
+@app.post("/webhook")
+async def telegram_webhook(request: Request):
+    try:
+        if TELEGRAM_SECRET_TOKEN:
+            got_secret = request.headers.get("X-Telegram-Bot-Api-Secret-Token", "")
+            if got_secret != TELEGRAM_SECRET_TOKEN:
+                print("WEBHOOK SECRET MISMATCH")
+                return JSONResponse({"ok": False, "error": "secret mismatch"}, status_code=403)
+
+        data = await request.json()
+        print("WEBHOOK DATA:", json.dumps(data, ensure_ascii=False)[:2000])
+
+        update = Update.model_validate(data)
+        await dp.feed_update(bot, update)
+
+        print("UPDATE FED OK")
+        return JSONResponse({"ok": True})
+
+    except Exception as e:
+        print("WEBHOOK ERROR:", repr(e))
+        traceback.print_exc()
+        return JSONResponse({"ok": False, "error": str(e)}, status_code=500)
+        
 # ================= STATES =================
 class BroadcastFSM(StatesGroup):
     waiting_content = State()
@@ -348,6 +371,11 @@ class AddressQueryFSM(StatesGroup):
     waiting_address = State()
 
 # ================= BASIC HELPERS =================
+@dp.message(lambda message: message.text and message.text.lower() == "ping")
+async def ping_test(message: types.Message):
+    print("PING TEST RECEIVED:", message.text)
+    await message.answer("pong")
+    
 def is_cmd(message: types.Message, *cmds):
     if not message or not message.text:
         return False
