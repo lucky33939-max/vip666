@@ -1148,8 +1148,8 @@ async def process_add_admin(message: types.Message, state: FSMContext):
         parse_mode="HTML",
     )
 
-    @dp.message(AdminFSM.waiting_del_admin)
-async def process_del_admin(message: types.Message, state: FSMContext):
+  @dp.message(AdminFSM.waiting_add_admin)
+async def process_add_admin(message: types.Message, state: FSMContext):
     if should_ignore_message(message):
         return
 
@@ -1163,7 +1163,7 @@ async def process_del_admin(message: types.Message, state: FSMContext):
     username = extract_username_only(message.text or "")
     if not username:
         await message.answer(
-            "请发送要删除的操作员用户名。\n\n"
+            "请发送要添加的操作员用户名。\n\n"
             "格式：@username\n\n"
             "例如：@abc123"
         )
@@ -1173,19 +1173,29 @@ async def process_del_admin(message: types.Message, state: FSMContext):
     if not target:
         await message.answer(
             "❌ 未找到该用户。\n\n"
-            "请确认用户名正确，且对方曾在本群发言。"
+            "请确认：\n"
+            "1. 对方已经在群里发过言\n"
+            "2. 用户名输入正确\n"
+            "3. 格式必须是 @username"
         )
         return
 
     target_id = int(target["user_id"])
-    remove_admin(target_id)
+    target_username = target.get("username") or ""
+    target_name = target.get("full_name") or ""
+
+    add_admin(target_id, "admin")
     await state.clear()
 
     await message.answer(
-        f"✅ 已删除操作员\n用户名：@{escape(target.get('username') or username)}\nID：<code>{target_id}</code>",
+        "✅ 已添加操作员\n"
+        f"用户名：@{escape(target_username)}\n"
+        f"姓名：{escape(target_name) if target_name else '未设置'}\n"
+        f"ID：<code>{target_id}</code>\n\n"
+        "现在对方可以使用机器人的操作功能。",
         parse_mode="HTML",
     )
-
+    
     await message.answer(
     "请发送要添加的操作员用户名。\n\n格式：@username"
 )
