@@ -406,6 +406,10 @@ def ensure_group(m: types.Message):
                 m.from_user.full_name or "",
             )
 
+@app.head("/")
+def home_head():
+    return {"ok": True}
+    
 def get_rate(chat_id):
     try:
         return float(get_chat_setting(chat_id, "rate", "190"))
