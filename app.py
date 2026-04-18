@@ -3703,16 +3703,14 @@ async def webhook(req: Request):
     if TELEGRAM_SECRET_TOKEN:
         secret = req.headers.get("x-telegram-bot-api-secret-token", "")
         if secret != TELEGRAM_SECRET_TOKEN:
+            print("webhook secret mismatch")
             raise HTTPException(status_code=401, detail="Unauthorized")
 
-    try:
-        data = await req.json()
-        update = types.Update.model_validate(data)
-        await dp.feed_update(bot, update)
-        return {"ok": True}
-    except Exception as e:
-        traceback.print_exc()
-        return JSONResponse(status_code=500, content={"ok": False, "error": str(e)})
+    data = await req.json()
+    update = types.Update.model_validate(data)
+    await dp.feed_update(bot, update)
+    return {"ok": True}
+
 
 # ================= WEB AUTH HELPERS =================
 def get_web_admin_name():
