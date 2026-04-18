@@ -157,12 +157,14 @@ HTTP_SESSION = None  # dùng chung cho aiohttp
 async def daily_usdt_update_loop():
     while True:
         try:
-            # placeholder, để sau nâng cấp thêm nếu cần
             await asyncio.sleep(3600)
+        except asyncio.CancelledError:
+            raise
         except Exception as e:
-            print("daily_usdt_update_loop error:", e)
+            print("daily_usdt_update_loop error:", repr(e))
+            traceback.print_exc()
             await asyncio.sleep(60)
-
+            
 async def expiry_warning_loop():
     while True:
         try:
@@ -173,22 +175,23 @@ async def expiry_warning_loop():
                 notice_key = f"expired:{expires_at}"
                 if has_expiry_notice(user_id, notice_key):
                     continue
-
                 try:
                     await bot.send_message(
                         user_id,
                         "⛔ 您的使用权限已到期。\n如需继续使用，请联系管理员或自助续费。"
                     )
                 except Exception as e:
-                    print("expiry notify error:", e)
-
+                    print("expiry notify error:", repr(e))
                 add_expiry_notice(user_id, notice_key)
 
+        except asyncio.CancelledError:
+            raise
         except Exception as e:
-            print("expiry_warning_loop error:", e)
+            print("expiry_warning_loop error:", repr(e))
+            traceback.print_exc()
 
         await asyncio.sleep(300)
-
+        
 async def activate_rental_order(order_code, granted_by=None):
     try:
         return approve_rental_order(order_code, granted_by=granted_by)
@@ -230,10 +233,7 @@ async def auto_check_payments():
                     if not txid or txid in used_txids:
                         continue
 
-                    if (
-                        tx.get("to") == PAYMENT_ADDRESS
-                        and abs(float(tx.get("amount", 0)) - amount) < AUTO_PAY_TOLERANCE
-                    ):
+                    if tx.get("to") == PAYMENT_ADDRESS and abs(float(tx.get("amount", 0)) - amount) < AUTO_PAY_TOLERANCE:
                         _, new_expires_at, err = await activate_rental_order(order_code)
 
                         if not err:
@@ -250,13 +250,15 @@ async def auto_check_payments():
                                     parse_mode="HTML",
                                 )
                             except Exception as e:
-                                print("notify auto paid error:", e)
+                                print("notify auto paid error:", repr(e))
 
                             print("AUTO PAID:", order_code, txid)
                             break
 
+        except asyncio.CancelledError:
+            raise
         except Exception as e:
-            print("AUTO PAY ERROR:", e)
+            print("AUTO PAY ERROR:", repr(e))
             traceback.print_exc()
 
         await asyncio.sleep(AUTO_PAY_INTERVAL)
