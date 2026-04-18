@@ -267,7 +267,7 @@ async def lifespan(app: FastAPI):
     global BOT_USERNAME, HTTP_SESSION
 
     HTTP_SESSION = aiohttp.ClientSession(
-        timeout=aiohttp.ClientTimeout(total=15)
+        timeout=aiohttp.ClientTimeout(total=20)
     )
 
     init_db()
@@ -277,26 +277,33 @@ async def lifespan(app: FastAPI):
         BOT_USERNAME = me.username
         print("Bot username:", BOT_USERNAME)
     except Exception as e:
-        print("get_me error:", e)
+        print("get_me error:", repr(e))
+        traceback.print_exc()
 
     if BOT_BASE_URL:
         webhook_url = f"{BOT_BASE_URL}/webhook"
         try:
+            await bot.delete_webhook(drop_pending_updates=False)
+        except Exception as e:
+            print("delete_webhook before set error:", repr(e))
+
+        try:
             await bot.set_webhook(
                 url=webhook_url,
                 secret_token=TELEGRAM_SECRET_TOKEN or None,
-                drop_pending_updates=True,
+                drop_pending_updates=False,
             )
             print("Webhook set:", webhook_url)
         except Exception as e:
-            print("set_webhook error:", e)
+            print("set_webhook error:", repr(e))
+            traceback.print_exc()
     else:
         print("BOT_BASE_URL not set, webhook not configured")
 
     tasks = [
-        asyncio.create_task(daily_usdt_update_loop()),
-        asyncio.create_task(expiry_warning_loop()),
-        asyncio.create_task(auto_check_payments()),
+        asyncio.create_task(daily_usdt_update_loop(), name="daily_usdt_update_loop"),
+        asyncio.create_task(expiry_warning_loop(), name="expiry_warning_loop"),
+        asyncio.create_task(auto_check_payments(), name="auto_check_payments"),
     ]
 
     try:
@@ -311,24 +318,19 @@ async def lifespan(app: FastAPI):
             except asyncio.CancelledError:
                 pass
             except Exception as e:
-                print("task shutdown error:", e)
-
-        if BOT_BASE_URL:
-            try:
-                await bot.delete_webhook(drop_pending_updates=False)
-            except Exception as e:
-                print("delete_webhook error:", e)
+                print(f"task shutdown error {task.get_name()}:", repr(e))
 
         try:
-            if HTTP_SESSION:
+            if HTTP_SESSION and not HTTP_SESSION.closed:
                 await HTTP_SESSION.close()
         except Exception as e:
-            print("HTTP_SESSION close error:", e)
+            print("HTTP_SESSION close error:", repr(e))
 
         try:
             await bot.session.close()
         except Exception as e:
-            print("bot session close error:", e)
+            print("bot session close error:", repr(e))
+            
 app = FastAPI(lifespan=lifespan)
 
 @app.post("/webhook")
@@ -348,7 +350,6 @@ async def telegram_webhook(request: Request):
 
         print("UPDATE FED OK")
         return JSONResponse({"ok": True})
-
     except Exception as e:
         print("WEBHOOK ERROR:", repr(e))
         traceback.print_exc()
