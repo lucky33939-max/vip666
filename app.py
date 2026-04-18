@@ -335,6 +335,10 @@ async def lifespan(app: FastAPI):
             
 app = FastAPI(lifespan=lifespan)
 
+@app.get("/")
+async def root():
+    return {"ok": True, "service": "vip666-1"}
+    
 @app.post("/webhook")
 async def telegram_webhook(request: Request):
     try:
