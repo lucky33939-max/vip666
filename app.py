@@ -1100,44 +1100,6 @@ def group_feature_text():
         "• 寄存：<code>P+2000</code>"
     )
 
-@dp.message(AdminFSM.waiting_del_admin)
-async def process_del_admin(message: types.Message, state: FSMContext):
-    if should_ignore_message(message):
-        return
-
-    if not can_manage_admins(message.from_user.id):
-        await message.answer("❌ 无权限")
-        await state.clear()
-        return
-
-    ensure_group(message)
-
-    username = extract_username_only(message.text or "")
-    if not username:
-        await message.answer(
-            "请发送要删除的操作员用户名。\n\n"
-            "格式：@username\n\n"
-            "例如：@abc123"
-        )
-        return
-
-    target = find_member_by_username(message.chat.id, username)
-    if not target:
-        await message.answer(
-            "❌ 未找到该用户。\n\n"
-            "请确认用户名正确，且对方曾在本群发言。"
-        )
-        return
-
-    target_id = int(target["user_id"])
-    remove_admin(target_id)
-    await state.clear()
-
-    await message.answer(
-        f"✅ 已删除操作员\n用户名：@{escape(target.get('username') or username)}\nID：<code>{target_id}</code>",
-        parse_mode="HTML",
-    )
-
 @dp.message(AdminFSM.waiting_add_admin)
 async def process_add_admin(message: types.Message, state: FSMContext):
     if should_ignore_message(message):
@@ -1183,6 +1145,45 @@ async def process_add_admin(message: types.Message, state: FSMContext):
         f"姓名：{escape(target_name) if target_name else '未设置'}\n"
         f"ID：<code>{target_id}</code>\n\n"
         "现在对方可以使用机器人的操作功能。",
+        parse_mode="HTML",
+    )
+
+
+@dp.message(AdminFSM.waiting_del_admin)
+async def process_del_admin(message: types.Message, state: FSMContext):
+    if should_ignore_message(message):
+        return
+
+    if not can_manage_admins(message.from_user.id):
+        await message.answer("❌ 无权限")
+        await state.clear()
+        return
+
+    ensure_group(message)
+
+    username = extract_username_only(message.text or "")
+    if not username:
+        await message.answer(
+            "请发送要删除的操作员用户名。\n\n"
+            "格式：@username\n\n"
+            "例如：@abc123"
+        )
+        return
+
+    target = find_member_by_username(message.chat.id, username)
+    if not target:
+        await message.answer(
+            "❌ 未找到该用户。\n\n"
+            "请确认用户名正确，且对方曾在本群发言。"
+        )
+        return
+
+    target_id = int(target["user_id"])
+    remove_admin(target_id)
+    await state.clear()
+
+    await message.answer(
+        f"✅ 已删除操作员\n用户名：@{escape(target.get('username') or username)}\nID：<code>{target_id}</code>",
         parse_mode="HTML",
     )
     
